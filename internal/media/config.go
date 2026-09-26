@@ -45,6 +45,12 @@ type HLSConfig struct {
 	X264Preset  string // -preset for libx264 (STREMIO_TRANSCODE_X264_PRESET)
 	X264CRF     int    // -crf for libx264 (STREMIO_TRANSCODE_X264_CRF)
 
+	// Tonemap is the tonemap filter algorithm used to convert HDR (PQ/HLG)
+	// sources to SDR BT.709 ("hable", "mobius", …; see TonemapAlgorithms).
+	// "" disables tone mapping, which is the default and today's behaviour
+	// (STREMIO_TRANSCODE_TONEMAP).
+	Tonemap string
+
 	// --- audio ---
 	AudioChannels int    // -ac (STREMIO_TRANSCODE_AUDIO_CHANNELS)
 	AudioBitrate  string // -b:a (STREMIO_TRANSCODE_AUDIO_BITRATE)
@@ -216,6 +222,9 @@ func (c HLSConfig) normalize(numCPU int) HLSConfig {
 	}
 	if c.ProbeTimeout <= 0 {
 		c.ProbeTimeout = d.ProbeTimeout
+	}
+	if c.Tonemap != "" && !IsTonemapAlgorithm(c.Tonemap) {
+		c.Tonemap = "" // unknown algorithm from a library caller: stay off
 	}
 	// MaxWidth/MaxHeight/WorkDir: 0/"" is a meaningful value (no downscale /
 	// OS-default temp dir), not "unset" — left as provided.
@@ -542,7 +551,22 @@ func deriveBandwidthCodecs(sc sessionConfig, outW, outH int, downscaled bool) (b
 //     transcodeSegment's high-bit-depth-safety note), so a plain CPU "scale"
 //     filter matches their existing chain style; scale_cuda/scale_npp would
 //     need a CUDA/NPP hw-frames context this codebase never establishes.
-func buildVideoFilter(codec string, needsFormatConv bool, scaledW, scaledH int, scaled bool) string {
+//
+// tm (zero value = off) switches to the software HDR→SDR tone-mapping chain
+// (see tonemapChain), which also performs the downscale in its first zscale
+// stage so the expensive float tone-map runs at output resolution. Its
+// 8-bit BT.709 output then feeds each backend's normal input: format=yuv420p
+// for the system-memory encoders, format=nv12,hwupload for VAAPI (no
+// scale_vaapi, since the frame is already scaled). With tm off the result
+// is byte-identical to the chain built before tone mapping existed.
+func buildVideoFilter(codec string, needsFormatConv bool, scaledW, scaledH int, scaled bool, tm tonemapPlan) string {
+	if tm.enabled() {
+		chain := tonemapChain(tm, scaledW, scaledH, scaled)
+		if codec == "h264_vaapi" {
+			return chain + ",format=nv12,hwupload"
+		}
+		return chain + ",format=yuv420p"
+	}
 	var filters []string
 	switch codec {
 	case "h264_vaapi":

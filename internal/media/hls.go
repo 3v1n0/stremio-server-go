@@ -86,6 +86,7 @@ type hlsSession struct {
 	hasVideo        bool                   // first video stream is real video (not absent / cover art)
 	videoEnd        float64                // where that video stream ends, seconds; 0 if unknown
 	isTS            bool                   // source container is MPEG-TS
+	color           videoColor             // probed colour metadata of the first video stream (HDR detection)
 	segLocks        map[string]*sync.Mutex // keyed by segment filename
 	lastAccess      atomic.Int64           // unix nanoseconds; updated on each StartHLS/HLSFile call
 	// inFlight counts calls currently executing HLSFile (which covers
@@ -147,6 +148,10 @@ type hlsManager struct {
 	selfBase string
 	enc      hwEncoder
 	cfg      HLSConfig
+	// tonemap is the HDR→SDR tone-mapping algorithm actually in effect:
+	// cfg.Tonemap when ffmpeg has the required filters, else "" (off). Set
+	// once in newHLS and read-only thereafter, like enc.
+	tonemap string
 	// settings is consulted at session-creation time (StartHLS) and on every
 	// transcode-slot acquisition to apply live /settings overrides (issue
 	// #20 "Related"). May be nil (no /settings integration; env defaults
@@ -314,11 +319,18 @@ func newHLS(selfBase string, cfg HLSConfig, settings SettingsSource) *hlsManager
 	} else {
 		logging.For("media").Warn("HLS transcode using software encoder; expect high CPU", "encoder", enc.codec, "hint", "set STREMIO_HWACCEL=vaapi and ensure /dev/dri access")
 	}
+	// Only probe ffmpeg's filter list when tone mapping was requested, so
+	// the default configuration spawns exactly the processes it always did.
+	var tonemap string
+	if cfg.Tonemap != "" {
+		tonemap = resolveTonemap(cfg.Tonemap, filtersList())
+	}
 	m := &hlsManager{
 		base:       base,
 		selfBase:   selfBase,
 		enc:        enc,
 		cfg:        cfg,
+		tonemap:    tonemap,
 		settings:   settings,
 		sessions:   map[string]*hlsSession{},
 		probeCache: map[string]probeCacheEntry{},
@@ -387,9 +399,10 @@ type probeMediaResult struct {
 	duration        float64
 	audioStreams    []audioStream
 	subtitleStreams []subtitleStream
-	highBitDepth    bool // true if any video stream is 10/12-bit
-	width           int  // first video stream's width; 0 if unknown/no video stream
-	height          int  // first video stream's height; 0 if unknown/no video stream
+	highBitDepth    bool       // true if any video stream is 10/12-bit
+	width           int        // first video stream's width; 0 if unknown/no video stream
+	height          int        // first video stream's height; 0 if unknown/no video stream
+	color           videoColor // first video stream's colour metadata (HDR detection)
 	// hasVideo is true when the first video stream (the one -map 0:v:0
 	// selects) is real video rather than attached cover art; videoEnd is
 	// that stream's duration (0 if unknown); isTS is true for MPEG-TS input.
@@ -422,6 +435,12 @@ func probeMedia(ctx context.Context, mediaURL, selfBase string, timeout time.Dur
 	if err != nil {
 		return probeMediaResult{}
 	}
+	return parseProbeOutput(out)
+}
+
+// parseProbeOutput decodes the JSON printed by probeMedia's ffprobe run
+// (-show_format -show_streams). Undecodable output yields the zero result.
+func parseProbeOutput(out []byte) probeMediaResult {
 	var r struct {
 		Format struct {
 			Duration   string `json:"duration"`
@@ -437,7 +456,15 @@ func probeMedia(ctx context.Context, mediaURL, selfBase string, timeout time.Dur
 			Width     int    `json:"width"`
 			Height    int    `json:"height"`
 			Duration  string `json:"duration"`
-			Tags      struct {
+			// Colour metadata, used to detect HDR (PQ/HLG) sources.
+			ColorTransfer  string `json:"color_transfer"`
+			ColorPrimaries string `json:"color_primaries"`
+			ColorSpace     string `json:"color_space"`
+			ColorRange     string `json:"color_range"`
+			// Decoded entry by entry (see doviFromSideData) so an unexpected
+			// field type in one side-data entry cannot fail the whole probe.
+			SideDataList []json.RawMessage `json:"side_data_list"`
+			Tags         struct {
 				Language string `json:"language"`
 				Title    string `json:"title"`
 				Duration string `json:"DURATION"` // Matroska per-stream duration
@@ -457,6 +484,7 @@ func probeMedia(ctx context.Context, mediaURL, selfBase string, timeout time.Dur
 	var subCount int // tracks 0-based index among subtitle streams
 	var highBit bool
 	var width, height int
+	var color videoColor
 	var sawVideo, hasVideo bool
 	var videoEnd float64
 	for _, st := range r.Streams {
@@ -492,6 +520,14 @@ func probeMedia(ctx context.Context, mediaURL, selfBase string, timeout time.Dur
 				if hasVideo {
 					videoEnd = parseStreamDuration(st.Duration, st.Tags.Duration)
 				}
+				// Colour metadata (HDR detection) from the first video stream.
+				color = videoColor{
+					transfer:   st.ColorTransfer,
+					primaries:  st.ColorPrimaries,
+					matrix:     st.ColorSpace,
+					colorRange: st.ColorRange,
+				}
+				doviFromSideData(&color, st.SideDataList)
 			}
 		case "subtitle":
 			// Only include text-based subtitle codecs that ffmpeg can convert to WebVTT.
@@ -514,7 +550,26 @@ func probeMedia(ctx context.Context, mediaURL, selfBase string, timeout time.Dur
 	return probeMediaResult{
 		duration: d, audioStreams: audio, subtitleStreams: subs, highBitDepth: highBit,
 		width: width, height: height, hasVideo: hasVideo, videoEnd: videoEnd,
-		isTS: strings.Contains(r.Format.FormatName, "mpegts"),
+		isTS: strings.Contains(r.Format.FormatName, "mpegts"), color: color,
+	}
+}
+
+// doviFromSideData fills c's Dolby Vision fields from a stream's
+// side_data_list, if it contains a "DOVI configuration record". Entries are
+// decoded individually and malformed ones are skipped.
+func doviFromSideData(c *videoColor, list []json.RawMessage) {
+	for _, raw := range list {
+		var sd struct {
+			SideDataType       string `json:"side_data_type"`
+			DVProfile          int    `json:"dv_profile"`
+			DVBLSignalCompatID int    `json:"dv_bl_signal_compatibility_id"`
+		}
+		if json.Unmarshal(raw, &sd) != nil || sd.SideDataType != "DOVI configuration record" {
+			continue
+		}
+		c.hasDOVI = true
+		c.doviProfile = sd.DVProfile
+		c.doviBLCompat = sd.DVBLSignalCompatID
 	}
 }
 
@@ -622,7 +677,9 @@ func (m *hlsManager) StartHLS(id, mediaURL string) (string, error) {
 		// Store result under the session write lock; another goroutine racing
 		// through StartHLS for the same id may have already stored a valid probe.
 		s.mu.Lock()
+		stored := false
 		if s.duration == 0 {
+			stored = true
 			s.duration = res.duration
 			s.audioStreams = res.audioStreams
 			s.subtitleStreams = res.subtitleStreams
@@ -633,8 +690,18 @@ func (m *hlsManager) StartHLS(id, mediaURL string) (string, error) {
 			s.hasVideo = res.hasVideo
 			s.videoEnd = res.videoEnd
 			s.isTS = res.isTS
+			s.color = res.color
 		}
 		s.mu.Unlock()
+		if stored && m.tonemap != "" {
+			if res.color.doviWithoutCompatibleBase() {
+				logging.For("media").Debug("dolby vision source without an HDR10/HLG base layer; not tone mapping",
+					"session", id, "dv_profile", res.color.doviProfile)
+			} else if planTonemap(m.tonemap, res.color).enabled() {
+				logging.For("media").Debug("tone mapping HDR source to SDR",
+					"session", id, "transfer", res.color.transfer, "algorithm", m.tonemap)
+			}
+		}
 	}
 
 	s.mu.RLock()
@@ -1170,6 +1237,11 @@ func (m *hlsManager) currentConcurrency() int {
 // "format=nv12,hwupload" handles 10→8 bit downconversion before GPU upload.
 // For other HW encoders, an explicit "format=yuv420p" filter is prepended when
 // s.highBitDepth is true.
+//
+// HDR→SDR tone mapping (STREMIO_TRANSCODE_TONEMAP, off by default): for a
+// PQ/HLG source the video filter becomes the software zscale+tonemap chain
+// (see tonemapChain/buildVideoFilter) and BT.709 colour tags are added; all
+// other sources, and every source with the knob off, are unaffected.
 func (m *hlsManager) transcodeSegment(ctx context.Context, s *hlsSession, n int, kind segKind, audioIdx int) (string, error) {
 	s.mu.RLock()
 	sessionDur := s.duration
@@ -1177,6 +1249,7 @@ func (m *hlsManager) transcodeSegment(ctx context.Context, s *hlsSession, n int,
 	srcWidth, srcHeight := s.srcWidth, s.srcHeight
 	hasVideo, videoEnd, isTS := s.hasVideo, s.videoEnd, s.isTS
 	hasAudio := len(s.audioStreams) > 0
+	color := s.color
 	tc := s.tc
 	s.mu.RUnlock()
 	var filename string
@@ -1211,13 +1284,17 @@ func (m *hlsManager) transcodeSegment(ctx context.Context, s *hlsSession, n int,
 	}
 	tmp := segFile + ".tmp.ts"
 
-	gopStr := strconv.Itoa(videoGOP)
-
 	// Downscale target for this segment's video (no-op unless MaxWidth/
 	// MaxHeight is configured and the source exceeds it — see
 	// computeScaledDims: aspect-preserving, even dimensions, never upscales).
 	outW, outH, scaled := computeScaledDims(srcWidth, srcHeight, tc.maxWidth, tc.maxHeight)
 
+	// HDR→SDR tone mapping (zero plan = off: SDR source or knob disabled).
+	// The pre-roll trim keeps the expensive chain off the frames the output
+	// -ss discards anyway (see tonemapPlan.trimStart); trimStart is set
+	// per-attempt inside run(), since preRoll (and so outputSeek) can differ
+	// between the first attempt and a longer-pre-roll retry.
+	tm := planTonemap(m.tonemap, color)
 	// SEC-4: route through the loopback relay instead of handing ffmpeg the
 	// real remote URL directly. Computed once and reused by both the
 	// hardware and (on fallback) software encode attempts below.
@@ -1252,6 +1329,13 @@ func (m *hlsManager) transcodeSegment(ctx context.Context, s *hlsSession, n int,
 		// pre-roll window; the output -ss discards the gap.
 		inputSeek := math.Max(0, start-preRoll)
 		outputSeek := start - inputSeek
+		// Per-attempt tone-map plan: trimStart tracks this attempt's own
+		// outputSeek, since preRoll (and so outputSeek) can differ between
+		// the first attempt and a longer-pre-roll retry (see transcodeChecked).
+		rtm := tm
+		if rtm.enabled() {
+			rtm.trimStart = outputSeek
+		}
 
 		a := []string{"-hide_banner", "-loglevel", "error", "-y"}
 
@@ -1291,72 +1375,7 @@ func (m *hlsManager) transcodeSegment(ctx context.Context, s *hlsSession, n int,
 
 		// ── Video encoding (segMuxed and segVideoOnly) ────────────────────────
 		if kind != segAudioOnly {
-			switch enc.codec {
-			case "h264_vaapi":
-				// SW decode + GPU encode: robust across codecs and bit-depths.
-				// format=nv12 converts 10/12-bit → 8-bit NV12 before hwupload;
-				// this is why we do not need explicit -pix_fmt for high-bit-depth.
-				// scale_vaapi (when scaled) runs after hwupload, on the GPU frame.
-				a = append(a,
-					"-vf", buildVideoFilter(enc.codec, true, outW, outH, scaled),
-					"-c:v", "h264_vaapi", "-qp", strconv.Itoa(m.cfg.VAAPIQP),
-					"-g", gopStr,
-					"-b:v", tc.videoBitrate, "-maxrate", tc.videoMaxrate, "-bufsize", tc.videoBufsize,
-				)
-
-			case "h264_nvenc":
-				// 10-bit inputs crash NVENC without explicit format conversion.
-				if vf := buildVideoFilter(enc.codec, highBitDepth, outW, outH, scaled); vf != "" {
-					a = append(a, "-vf", vf)
-				}
-				a = append(a,
-					"-c:v", "h264_nvenc", "-preset", tc.nvencPreset, "-rc", "vbr",
-					"-g", gopStr,
-					"-b:v", tc.videoBitrate, "-maxrate", tc.videoMaxrate, "-bufsize", tc.videoBufsize,
-				)
-
-			case "h264_qsv":
-				if vf := buildVideoFilter(enc.codec, highBitDepth, outW, outH, scaled); vf != "" {
-					a = append(a, "-vf", vf)
-				}
-				a = append(a,
-					"-c:v", "h264_qsv", "-preset", tc.qsvPreset,
-					"-g", gopStr,
-					"-b:v", tc.videoBitrate, "-maxrate", tc.videoMaxrate, "-bufsize", tc.videoBufsize,
-				)
-
-			case "h264_videotoolbox":
-				if vf := buildVideoFilter(enc.codec, highBitDepth, outW, outH, scaled); vf != "" {
-					a = append(a, "-vf", vf)
-				}
-				a = append(a,
-					"-c:v", "h264_videotoolbox", "-realtime", "1",
-					"-g", gopStr,
-					"-b:v", tc.videoBitrate, "-maxrate", tc.videoMaxrate, "-bufsize", tc.videoBufsize,
-				)
-
-			case "h264_v4l2m2m":
-				if vf := buildVideoFilter(enc.codec, highBitDepth, outW, outH, scaled); vf != "" {
-					a = append(a, "-vf", vf)
-				}
-				a = append(a,
-					"-c:v", "h264_v4l2m2m",
-					"-g", gopStr,
-					"-b:v", tc.videoBitrate, "-maxrate", tc.videoMaxrate, "-bufsize", tc.videoBufsize,
-				)
-
-			default: // libx264 — quality-constrained CRF with bitrate ceiling
-				a = append(a,
-					"-vf", buildVideoFilter("libx264", true, outW, outH, scaled), // ensure 8-bit even for 10-bit inputs
-					"-c:v", "libx264", "-preset", tc.x264Preset, "-crf", strconv.Itoa(m.cfg.X264CRF),
-					"-profile:v", "high",
-					// sc_threshold=0 disables scene-cut detection so -g is strictly
-					// honoured; -keyint_min enforces IDR at every GOP boundary.
-					"-sc_threshold", "0",
-					"-g", gopStr, "-keyint_min", gopStr,
-					"-b:v", tc.videoBitrate, "-maxrate", tc.videoMaxrate, "-bufsize", tc.videoBufsize,
-				)
-			}
+			a = append(a, videoEncodeArgs(enc.codec, highBitDepth, outW, outH, scaled, tc, m.cfg, rtm)...)
 		}
 
 		// ── Audio encoding (segMuxed and segAudioOnly) ────────────────────────
@@ -1490,6 +1509,86 @@ func (s *hlsSession) installSegment(filename, src, reason string) (string, error
 		return "", err
 	}
 	return dst, nil
+}
+
+// videoEncodeArgs returns the video filter + encoder arguments for one
+// segment transcode with the given encoder backend (see transcodeSegment for
+// the surrounding input/audio/mux arguments). Kept free of I/O so the exact
+// argument lists can be asserted in tests. tm is the tone-mapping plan; its
+// zero value reproduces the pre-tone-mapping arguments byte-for-byte.
+func videoEncodeArgs(codec string, highBitDepth bool, outW, outH int, scaled bool, tc sessionConfig, cfg HLSConfig, tm tonemapPlan) []string {
+	gopStr := strconv.Itoa(videoGOP)
+	var a []string
+	switch codec {
+	case "h264_vaapi":
+		// SW decode + GPU encode: robust across codecs and bit-depths.
+		// format=nv12 converts 10/12-bit → 8-bit NV12 before hwupload;
+		// this is why we do not need explicit -pix_fmt for high-bit-depth.
+		// scale_vaapi (when scaled) runs after hwupload, on the GPU frame.
+		a = append(a,
+			"-vf", buildVideoFilter(codec, true, outW, outH, scaled, tm),
+			"-c:v", "h264_vaapi", "-qp", strconv.Itoa(cfg.VAAPIQP),
+			"-g", gopStr,
+			"-b:v", tc.videoBitrate, "-maxrate", tc.videoMaxrate, "-bufsize", tc.videoBufsize,
+		)
+
+	case "h264_nvenc":
+		// 10-bit inputs crash NVENC without explicit format conversion.
+		if vf := buildVideoFilter(codec, highBitDepth, outW, outH, scaled, tm); vf != "" {
+			a = append(a, "-vf", vf)
+		}
+		a = append(a,
+			"-c:v", "h264_nvenc", "-preset", tc.nvencPreset, "-rc", "vbr",
+			"-g", gopStr,
+			"-b:v", tc.videoBitrate, "-maxrate", tc.videoMaxrate, "-bufsize", tc.videoBufsize,
+		)
+
+	case "h264_qsv":
+		if vf := buildVideoFilter(codec, highBitDepth, outW, outH, scaled, tm); vf != "" {
+			a = append(a, "-vf", vf)
+		}
+		a = append(a,
+			"-c:v", "h264_qsv", "-preset", tc.qsvPreset,
+			"-g", gopStr,
+			"-b:v", tc.videoBitrate, "-maxrate", tc.videoMaxrate, "-bufsize", tc.videoBufsize,
+		)
+
+	case "h264_videotoolbox":
+		if vf := buildVideoFilter(codec, highBitDepth, outW, outH, scaled, tm); vf != "" {
+			a = append(a, "-vf", vf)
+		}
+		a = append(a,
+			"-c:v", "h264_videotoolbox", "-realtime", "1",
+			"-g", gopStr,
+			"-b:v", tc.videoBitrate, "-maxrate", tc.videoMaxrate, "-bufsize", tc.videoBufsize,
+		)
+
+	case "h264_v4l2m2m":
+		if vf := buildVideoFilter(codec, highBitDepth, outW, outH, scaled, tm); vf != "" {
+			a = append(a, "-vf", vf)
+		}
+		a = append(a,
+			"-c:v", "h264_v4l2m2m",
+			"-g", gopStr,
+			"-b:v", tc.videoBitrate, "-maxrate", tc.videoMaxrate, "-bufsize", tc.videoBufsize,
+		)
+
+	default: // libx264 — quality-constrained CRF with bitrate ceiling
+		a = append(a,
+			"-vf", buildVideoFilter("libx264", true, outW, outH, scaled, tm), // ensure 8-bit even for 10-bit inputs
+			"-c:v", "libx264", "-preset", tc.x264Preset, "-crf", strconv.Itoa(cfg.X264CRF),
+			"-profile:v", "high",
+			// sc_threshold=0 disables scene-cut detection so -g is strictly
+			// honoured; -keyint_min enforces IDR at every GOP boundary.
+			"-sc_threshold", "0",
+			"-g", gopStr, "-keyint_min", gopStr,
+			"-b:v", tc.videoBitrate, "-maxrate", tc.videoMaxrate, "-bufsize", tc.videoBufsize,
+		)
+	}
+	if tm.enabled() {
+		a = append(a, tonemapOutputTags...)
+	}
+	return a
 }
 
 // ── CloseHLS ──────────────────────────────────────────────────────────────────

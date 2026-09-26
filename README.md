@@ -118,6 +118,7 @@ Then point any Stremio client's **streaming server URL** at
 | `STREMIO_TRANSCODE_QSV_PRESET` | `veryfast` | Intel Quick Sync (`h264_qsv`) encoder preset (`-preset`): `veryfast`, `faster`, `fast`, `medium`, `slow`, `slower` or `veryslow`. Overridden by the `transcodeProfile` `/settings` value — see `STREMIO_TRANSCODE_X264_PRESET`. Behaviour change: QSV previously always used `veryfast` and ignored `transcodeProfile`; a `transcodeProfile` of e.g. `slow`/`veryslow` now reaches QSV as well and may not keep up in real time on low-power iGPUs (the env default stays `veryfast` for that reason). |
 | `STREMIO_TRANSCODE_X264_PRESET` | `veryfast` | libx264 encoder preset (`-preset`). The `transcodeProfile` `/settings` value overrides this, `STREMIO_TRANSCODE_NVENC_PRESET` and `STREMIO_TRANSCODE_QSV_PRESET` together when it names a recognized libx264 preset (`ultrafast` … `veryslow`), mapped to the closest NVENC preset and to the same-named QSV preset (`ultrafast`/`superfast`, which QSV lacks, map to `veryfast`). |
 | `STREMIO_TRANSCODE_X264_CRF` | `23` | libx264 constant rate factor (`-crf`, lower = higher quality). |
+| `STREMIO_TRANSCODE_TONEMAP` | `off` | HDR→SDR tone mapping for HLS transcodes of HDR10/HDR10+/HLG sources (detected from the probed PQ/HLG transfer, not bit depth). `off` (default) keeps today's plain pixel-format conversion, which leaves HDR sources looking washed out and grey. `on`/`true`/`1`/`yes` = `mobius` (in testing it came closest to the SDR reference brightness; `hable` was noticeably darker); or pick the tonemap algorithm explicitly: `mobius`, `hable`, `reinhard`, `clip`, `linear`, `gamma`. Invalid values log a warning and stay off. Requires an ffmpeg with the `zscale` (libzimg) and `tonemap` filters; if either is missing a warning is logged at startup and transcodes fall back to today's behaviour. Runs in software on every encoder path and is CPU-heavy — combine with `STREMIO_TRANSCODE_MAX_WIDTH`/`_MAX_HEIGHT` (the downscale happens before tone mapping). See below. |
 | `STREMIO_TRANSCODE_AUDIO_CHANNELS` | `2` | output audio channel count (`-ac`). |
 | `STREMIO_TRANSCODE_AUDIO_BITRATE` | `192k` | output AAC audio bitrate (`-b:a`), ffmpeg bitrate syntax. |
 | `STREMIO_TRANSCODE_CONCURRENCY` | _(`runtime.NumCPU()`)_ | maximum concurrent `ffmpeg` segment transcode jobs across every HLS session. The `transcodeConcurrency` `/settings` value (schema default `1`) overrides this live — re-read on every transcode, not just new sessions — only when it's both `>0` and different from `1`, for the same untouched-default reason as `STREMIO_TRANSCODE_MAX_WIDTH`. |
@@ -172,6 +173,22 @@ session, `400` invalid id (the same ids `master.m3u8` rejects). Like every
 route it is subject to the `STREMIO_ALLOWED_ORIGINS` Origin allowlist.
 Re-creating the same id is refused until a deferred removal has finished.
 
+HDR→SDR tone mapping (`STREMIO_TRANSCODE_TONEMAP`) applies only to sources
+whose first video stream reports a PQ (`smpte2084`) or HLG (`arib-std-b67`)
+transfer; SDR sources (including 10-bit SDR) are transcoded exactly as before.
+Missing or unexpected primaries/matrix/range tags fall back to BT.2020
+limited range.
+The chain is `zscale` (linearise, and downscale when a max size is set) →
+`tonemap` → `zscale` to BT.709, done in software before each encoder's usual
+input (`format=yuv420p`, or `format=nv12,hwupload` for VAAPI), and the output
+is tagged BT.709. On an 8-core Ryzen 7 7735HS with a 4K HEVC HDR10 source and
+1080p libx264 output, a 4-second segment took roughly 1–1.5 s longer with
+tone mapping than without; without a downscale (4K output) it runs about 2x
+slower than real time here, so set a max width/height on low-power hardware.
+Dolby Vision profile 5 (no HDR10/HLG base layer) is detected and left
+untouched, since its colours are only correct after applying the DV
+reshaping this chain does not do; profiles 7/8.1/8.4 go through the HDR10 or
+HLG path via their base layer.
 ### Censorship resistance
 
 The server uses DHT (BEP32), PEX (BEP11), HTTP webseeds, and a ranked public

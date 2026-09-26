@@ -274,7 +274,7 @@ func TestBuildVideoFilter(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := buildVideoFilter(c.codec, c.needsFormatConv, 1280, 720, c.scaled)
+			got := buildVideoFilter(c.codec, c.needsFormatConv, 1280, 720, c.scaled, tonemapPlan{})
 			if got != c.want {
 				t.Errorf("buildVideoFilter(%q, conv=%v, scaled=%v) = %q, want %q", c.codec, c.needsFormatConv, c.scaled, got, c.want)
 			}

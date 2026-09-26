@@ -650,6 +650,7 @@ func hlsConfig(lookup Lookup) media.HLSConfig {
 		QSVPreset:   getenv(lookup, "STREMIO_TRANSCODE_QSV_PRESET", d.QSVPreset),
 		X264Preset:  getenv(lookup, "STREMIO_TRANSCODE_X264_PRESET", d.X264Preset),
 		X264CRF:     envInt(lookup, "STREMIO_TRANSCODE_X264_CRF", d.X264CRF),
+		Tonemap:     envTonemap(lookup, "STREMIO_TRANSCODE_TONEMAP"),
 
 		AudioChannels: envInt(lookup, "STREMIO_TRANSCODE_AUDIO_CHANNELS", d.AudioChannels),
 		AudioBitrate:  envBitrate(lookup, "STREMIO_TRANSCODE_AUDIO_BITRATE", d.AudioBitrate),

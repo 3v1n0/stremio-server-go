@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/M0Rf30/stremio-server-go/internal/logging"
+	"github.com/M0Rf30/stremio-server-go/internal/media"
 )
 
 // Lookup resolves a configuration key, mirroring os.LookupEnv's (value, ok)
@@ -144,6 +145,29 @@ func envBitrate(lookup Lookup, key, def string) string {
 		return def
 	}
 	return v
+}
+
+// envTonemap parses STREMIO_TRANSCODE_TONEMAP, the HDR→SDR tone-mapping
+// algorithm for HLS transcodes. Unset/empty or off/0/false/no/none → ""
+// (disabled, today's behaviour); on/1/true/yes → "mobius" (measured closest
+// to the SDR reference brightness; "hable" is noticeably darker); one of
+// media.TonemapAlgorithms (case-insensitive) → that algorithm. Anything
+// else is rejected with a warning and tone mapping stays off.
+func envTonemap(lookup Lookup, key string) string {
+	v, _ := lookup(key)
+	v = strings.ToLower(strings.TrimSpace(v))
+	switch v {
+	case "", "off", "0", "false", "no", "none":
+		return ""
+	case "on", "1", "true", "yes":
+		return "mobius"
+	}
+	if media.IsTonemapAlgorithm(v) {
+		return v
+	}
+	logging.For("config").Warn("invalid tonemap env; tone mapping disabled", "key", key, "value", v,
+		"valid", "off|on|"+strings.Join(media.TonemapAlgorithms, "|"))
+	return ""
 }
 
 // allowedOrigins parses STREMIO_ALLOWED_ORIGINS (Contract 2 / SEC-1): a

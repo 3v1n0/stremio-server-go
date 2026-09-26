@@ -170,6 +170,7 @@ func TestHLSConfigEveryKnobOverridable(t *testing.T) {
 		"STREMIO_TRANSCODE_QSV_PRESET":     "medium",
 		"STREMIO_TRANSCODE_X264_PRESET":    "fast",
 		"STREMIO_TRANSCODE_X264_CRF":       "20",
+		"STREMIO_TRANSCODE_TONEMAP":        "mobius",
 		"STREMIO_TRANSCODE_AUDIO_CHANNELS": "6",
 		"STREMIO_TRANSCODE_AUDIO_BITRATE":  "256k",
 		"STREMIO_TRANSCODE_CONCURRENCY":    "2",
@@ -196,6 +197,7 @@ func TestHLSConfigEveryKnobOverridable(t *testing.T) {
 		QSVPreset:          "medium",
 		X264Preset:         "fast",
 		X264CRF:            20,
+		Tonemap:            "mobius",
 		AudioChannels:      6,
 		AudioBitrate:       "256k",
 		SegmentConcurrency: 2,
@@ -206,6 +208,47 @@ func TestHLSConfigEveryKnobOverridable(t *testing.T) {
 	}
 	if got != want {
 		t.Errorf("hlsConfig(full env) = %+v,\nwant %+v", got, want)
+	}
+}
+
+func TestEnvTonemap(t *testing.T) {
+	cases := []struct {
+		name  string
+		value string
+		set   bool
+		want  string
+	}{
+		{"unset", "", false, ""},
+		{"empty", "", true, ""},
+		{"off", "off", true, ""},
+		{"0", "0", true, ""},
+		{"false", "false", true, ""},
+		{"none", "none", true, ""},
+		{"on", "on", true, "mobius"},
+		{"true", "TRUE", true, "mobius"},
+		{"1", "1", true, "mobius"},
+		{"yes", "yes", true, "mobius"},
+		{"hable", "hable", true, "hable"},
+		{"mobius", "mobius", true, "mobius"},
+		{"reinhard mixed case, padded", " Reinhard ", true, "reinhard"},
+		{"clip", "clip", true, "clip"},
+		{"linear", "linear", true, "linear"},
+		{"gamma", "gamma", true, "gamma"},
+		{"invalid", "bt2390", true, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			env := map[string]string{}
+			if c.set {
+				env["STREMIO_TRANSCODE_TONEMAP"] = c.value
+			}
+			if got := envTonemap(MapLookup(env), "STREMIO_TRANSCODE_TONEMAP"); got != c.want {
+				t.Errorf("envTonemap(%q) = %q, want %q", c.value, got, c.want)
+			}
+			if got := hlsConfig(MapLookup(env)).Tonemap; got != c.want {
+				t.Errorf("hlsConfig(...).Tonemap for %q = %q, want %q", c.value, got, c.want)
+			}
+		})
 	}
 }
 
