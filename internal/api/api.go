@@ -261,7 +261,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	hdr["Access-Control-Expose-Headers"] = corsExposeHeaders
 	if r.Method == http.MethodOptions {
-		hdr.Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+		hdr.Set("Access-Control-Allow-Methods", "POST, GET, DELETE, OPTIONS")
 		hdr.Set("Access-Control-Allow-Headers", "Range, Content-Type, Accept, Authorization")
 		hdr.Set("Access-Control-Max-Age", "1728000")
 		if r.Header.Get("Access-Control-Request-Private-Network") == "true" {
@@ -1367,6 +1367,10 @@ func (s *server) handleHLSProbe(w http.ResponseWriter, r *http.Request) {
 // @Success  200  {string}  string  "m3u8 / MPEG-TS / WebVTT"
 // @Router   /hlsv2/{id}/{file} [get]
 func (s *server) handleHLS(w http.ResponseWriter, r *http.Request, seg []string) {
+	if r.Method == http.MethodDelete {
+		s.handleHLSDelete(w, r, seg)
+		return
+	}
 	if len(seg) >= 2 && seg[1] == "probe" {
 		s.handleHLSProbe(w, r)
 		return
@@ -1395,6 +1399,39 @@ func (s *server) handleHLS(w http.ResponseWriter, r *http.Request, seg []string)
 	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Cache-Control", "no-cache")
 	http.ServeFile(w, r, path)
+}
+
+// handleHLSDelete ends an HLS session on request (DELETE /hlsv2/{id}): the
+// session is unregistered at once and its segment cache is removed from disk
+// as soon as no request for it is still being served. Lets a front end that
+// manages its own session lifecycle clean up without waiting for the idle
+// reaper, and is the only way to end a session when
+// STREMIO_HLS_SESSION_TTL=0 disables idle eviction. Like every other route
+// it is gated by the Origin allowlist in ServeHTTP.
+//
+// @Summary  Delete an HLS transcode session
+// @Tags     HLS
+// @Param    id  path  string  true  "session id"
+// @Success  204  "session deleted"
+// @Failure  400  {string}  string  "invalid session id"
+// @Failure  404  {string}  string  "unknown session"
+// @Router   /hlsv2/{id} [delete]
+func (s *server) handleHLSDelete(w http.ResponseWriter, r *http.Request, seg []string) {
+	if len(seg) != 2 {
+		http.NotFound(w, r)
+		return
+	}
+	err := s.prober.DeleteHLS(seg[1])
+	switch {
+	case err == nil:
+		w.WriteHeader(http.StatusNoContent)
+	case errors.Is(err, types.ErrHLSInvalidSessionID):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	case errors.Is(err, types.ErrHLSSessionNotFound):
+		http.Error(w, err.Error(), http.StatusNotFound)
+	default:
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
 
 // @Summary  List media tracks for a URL

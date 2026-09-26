@@ -98,7 +98,7 @@ Then point any Stremio client's **streaming server URL** at
 | `STREMIO_FTP_ALLOW_PRIVATE` | _(off)_ | `1`/`true` lets `/ftp` reach private/loopback/RFC1918 hosts. Off by default (SSRF guard); the cloud-metadata address stays blocked either way. Enable to stream from a LAN NAS. |
 | `STREMIO_LOCAL_IMDB` | `on` | local-files add-on resolves filenames to IMDB ids/metadata via IMDb's suggestion API (catalog posters/titles). **Enabled by default**; set `=0`/`off` to disable — local files then keep filename titles + `local:` ids and no request is sent to IMDb. |
 | `STREMIO_HWACCEL` | _(auto)_ | `0` forces software transcode; or pin `vaapi`/`nvenc`/… |
-| `STREMIO_HLS_SESSION_TTL` | `60` | seconds (or a Go duration string, e.g. `2m`) an HLS transcode session may sit idle before the reaper evicts it and frees its segment cache. A paused player that comes back after this window sees `unknown session` and must re-request the master playlist. |
+| `STREMIO_HLS_SESSION_TTL` | `60` | seconds (or a Go duration string, e.g. `2m`) an HLS transcode session may sit idle before the reaper evicts it and frees its segment cache. A paused player that comes back after this window sees `unknown session` and must re-request the master playlist. `0` disables idle eviction: sessions (and their segment caches) are kept until `DELETE /hlsv2/{id}` or shutdown, and still count toward `STREMIO_HLS_MAX_SESSIONS`. Negative or invalid values fall back to `60`; note that `0` itself also fell back to `60` before this meaning was introduced. |
 | `STREMIO_HLS_REAPER_INTERVAL` | _(derived)_ | seconds (or a duration string) between HLS idle-session sweeps. Defaults to `min(30s, STREMIO_HLS_SESSION_TTL/2)` so a shorter TTL is still reaped promptly; set explicitly to override the derived value. |
 | `STREMIO_HLS_NEG_PROBE_TTL` | `300` (`5m`) | seconds (or a duration string) a failed/zero-duration `ffprobe` result is cached, to avoid hammering a broken URL (e.g. a torrent with no peers yet) with repeated probes. |
 | `STREMIO_HLS_POS_PROBE_TTL` | `600` (`10m`) | seconds (or a duration string) a successful `ffprobe` result is cached, so duplicate HLS sessions for the same URL skip re-probing. |
@@ -161,6 +161,16 @@ are derived from the effective bitrate cap and output resolution — the
 Level 5.1). An unconfigured server (no bitrate/resolution knob touched) keeps
 advertising the historical fixed `BANDWIDTH=4000000`/`avc1.640029` regardless
 of actual source resolution, so upgrading never changes existing playback.
+
+`DELETE /hlsv2/{id}` ends an HLS transcode session explicitly, for front ends
+that manage their own session lifecycle rather than relying on the idle
+reaper (and the only way to end one when `STREMIO_HLS_SESSION_TTL=0`). The
+session is unregistered at once, so later requests for it get `unknown
+session`, and its segment cache is removed from disk as soon as no request
+for it is still being served. Responses: `204` deleted, `404` unknown
+session, `400` invalid id (the same ids `master.m3u8` rejects). Like every
+route it is subject to the `STREMIO_ALLOWED_ORIGINS` Origin allowlist.
+Re-creating the same id is refused until a deferred removal has finished.
 
 ### Censorship resistance
 

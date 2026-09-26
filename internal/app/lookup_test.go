@@ -106,6 +106,43 @@ func TestHLSConfigSessionTTLOverrideDerivesReaperInterval(t *testing.T) {
 	}
 }
 
+// STREMIO_HLS_SESSION_TTL=0 disables idle eviction (like
+// STREMIO_TORRENT_IDLE_TIMEOUT=0); unset keeps the 60s default and negative or
+// invalid values keep falling back to it. In every case the derived reaper
+// interval stays a sane positive value (never 0, which would panic
+// time.NewTicker, or a tiny busy-loop interval).
+func TestHLSConfigSessionTTLZeroDisablesEviction(t *testing.T) {
+	cases := []struct {
+		name        string
+		env         map[string]string
+		wantTTL     time.Duration
+		wantDisable bool
+	}{
+		{"unset", map[string]string{}, 60 * time.Second, false},
+		{"empty", map[string]string{"STREMIO_HLS_SESSION_TTL": ""}, 60 * time.Second, false},
+		{"zero", map[string]string{"STREMIO_HLS_SESSION_TTL": "0"}, 0, true},
+		{"zero duration string", map[string]string{"STREMIO_HLS_SESSION_TTL": "0s"}, 0, true},
+		{"negative seconds", map[string]string{"STREMIO_HLS_SESSION_TTL": "-5"}, 60 * time.Second, false},
+		{"negative duration", map[string]string{"STREMIO_HLS_SESSION_TTL": "-1m"}, 60 * time.Second, false},
+		{"invalid", map[string]string{"STREMIO_HLS_SESSION_TTL": "forever"}, 60 * time.Second, false},
+		{"positive", map[string]string{"STREMIO_HLS_SESSION_TTL": "90"}, 90 * time.Second, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := hlsConfig(MapLookup(c.env))
+			if got.SessionTTL != c.wantTTL {
+				t.Errorf("SessionTTL = %s, want %s", got.SessionTTL, c.wantTTL)
+			}
+			if got.DisableIdleEviction != c.wantDisable {
+				t.Errorf("DisableIdleEviction = %v, want %v", got.DisableIdleEviction, c.wantDisable)
+			}
+			if got.ReaperInterval != 30*time.Second {
+				t.Errorf("ReaperInterval = %s, want 30s", got.ReaperInterval)
+			}
+		})
+	}
+}
+
 func TestHLSConfigReaperIntervalExplicitOverride(t *testing.T) {
 	got := hlsConfig(MapLookup(map[string]string{
 		"STREMIO_HLS_SESSION_TTL":     "10s",

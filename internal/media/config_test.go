@@ -67,7 +67,8 @@ func TestDefaultReaperInterval(t *testing.T) {
 		{60 * time.Second, 30 * time.Second},      // issue #20 example: min(30s, 60/2) = 30s
 		{10 * time.Second, 5 * time.Second},       // scales down with a short TTL
 		{300 * time.Second, 30 * time.Second},     // capped at 30s for a long TTL
-		{0, 30 * time.Second},                     // degenerate: falls back to 30s
+		{0, 30 * time.Second},                     // STREMIO_HLS_SESSION_TTL=0 (never evict): keeps 30s, never a 0 interval
+		{-5 * time.Second, 30 * time.Second},      // negative: falls back to 30s
 		{1 * time.Second, 500 * time.Millisecond}, // half (500ms) is under the 30s cap
 	}
 	for _, c := range cases {

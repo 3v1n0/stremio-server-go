@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/M0Rf30/stremio-server-go/internal/logging"
+	"github.com/M0Rf30/stremio-server-go/internal/types"
 )
 
 // segDur is the HLS segment length in seconds.
@@ -99,6 +100,13 @@ type hlsSession struct {
 	// next transcode of that segment can remove them. Guarded by mu; nil
 	// until first use.
 	provisional map[string][]string
+	// deleted is set by DeleteHLS once the session has been unregistered from
+	// hlsManager.sessions. HLSFile's exit path checks it after decrementing
+	// inFlight so the last in-flight call can finish a deferred deletion (see
+	// DeleteHLS). removed makes the directory removal itself run exactly once
+	// even when DeleteHLS and that last exit both observe inFlight == 0.
+	deleted atomic.Bool
+	removed atomic.Bool
 	// playlistData records which segPrefix playlists have already been rendered
 	// and written to disk; content is immutable once duration is set, so a
 	// presence marker is enough to skip the rebuild + write.  Guarded by mu.
@@ -148,6 +156,12 @@ type hlsManager struct {
 	mu         sync.Mutex
 	sessions   map[string]*hlsSession
 	probeCache map[string]probeCacheEntry // probe cache (positive+negative); keyed by mediaURL
+	// draining holds sessions removed by DeleteHLS whose directory has not
+	// been deleted from disk yet (an HLSFile call was still in flight, or the
+	// RemoveAll is in progress). StartHLS refuses to re-create an id listed
+	// here, because the new session would reuse the same <base>/<id>
+	// directory and the pending RemoveAll would wipe it. Lazily allocated.
+	draining map[string]*hlsSession
 	// semHeld is the number of concurrent ffmpeg segment-transcode slots
 	// currently held, bounded by currentConcurrency() (see
 	// acquireTranscodeSlot). A plain atomic counter instead of a
@@ -533,12 +547,16 @@ func (m *hlsManager) StartHLS(id, mediaURL string) (string, error) {
 		return "", fmt.Errorf("hls: %w", err)
 	}
 	// Reject ids that could escape the base directory via path traversal.
-	if id == "" || id == "." || id == ".." || id != filepath.Base(id) || strings.Contains(id, "..") {
-		return "", fmt.Errorf("hls: invalid session id %q", id)
+	if !validSessionID(id) {
+		return "", fmt.Errorf("hls: %w %q", types.ErrHLSInvalidSessionID, id)
 	}
 	m.mu.Lock()
 	s, ok := m.sessions[id]
 	if !ok {
+		if _, busy := m.draining[id]; busy {
+			m.mu.Unlock()
+			return "", fmt.Errorf("hls: session %q is still being deleted; retry shortly", id)
+		}
 		if len(m.sessions) >= m.cfg.MaxSessions {
 			m.mu.Unlock()
 			return "", fmt.Errorf("hls: too many concurrent sessions (limit %d)", m.cfg.MaxSessions)
@@ -637,6 +655,13 @@ func (m *hlsManager) StartHLS(id, mediaURL string) (string, error) {
 		bandwidth:       bandwidth,
 		codecsVideo:     codecsVideo,
 	}), nil
+}
+
+// validSessionID reports whether id is safe to use as a directory name under
+// the manager's base dir: non-empty, a single path element, and free of "..".
+// Shared by StartHLS and DeleteHLS so both accept exactly the same ids.
+func validSessionID(id string) bool {
+	return id != "" && id != "." && id != ".." && id == filepath.Base(id) && !strings.Contains(id, "..")
 }
 
 // masterPlaylistInputs bundles everything buildMasterPlaylist needs,
@@ -774,7 +799,7 @@ func (m *hlsManager) HLSFile(ctx context.Context, id, name string) (string, stri
 	}
 	m.mu.Unlock()
 	if !ok {
-		return "", "", fmt.Errorf("hls: unknown session %s", id)
+		return "", "", fmt.Errorf("hls: %w %s", types.ErrHLSSessionNotFound, id)
 	}
 	// Held for the whole call, including transcodeSegment/extractSubtitle,
 	// which can run well past SessionTTL on a slow/software-encode host.
@@ -783,9 +808,15 @@ func (m *hlsManager) HLSFile(ctx context.Context, id, name string) (string, stri
 	// write. lastAccess is refreshed again on the way out (success or error)
 	// so the idle clock restarts from completion, not from before the
 	// transcode began.
+	//
+	// If DeleteHLS ran while this call was in progress it left the directory
+	// in place (inFlight > 0); the call that brings inFlight back to 0 then
+	// performs the removal instead. See DeleteHLS for why this cannot race.
 	defer func() {
 		s.lastAccess.Store(time.Now().UnixNano())
-		s.inFlight.Add(-1)
+		if s.inFlight.Add(-1) == 0 && s.deleted.Load() {
+			m.removeDeletedSession(id, s)
+		}
 	}()
 
 	name = filepath.Base(name)
@@ -1477,9 +1508,83 @@ func (m *hlsManager) CloseHLS() {
 	}
 	m.mu.Lock()
 	m.sessions = map[string]*hlsSession{}
+	m.draining = nil
 	m.mu.Unlock()
 	// RemoveAll outside the lock: disk I/O must not stall concurrent requests.
 	_ = os.RemoveAll(m.base)
+}
+
+// ── DeleteHLS ─────────────────────────────────────────────────────────────────
+
+// DeleteHLS explicitly ends session id, for front ends that manage their own
+// session lifecycle instead of relying on the idle reaper (and the only way
+// to end a session when idle eviction is disabled, STREMIO_HLS_SESSION_TTL=0).
+//
+// The session is removed from m.sessions immediately, so every later HLSFile
+// call gets "unknown session" and a later StartHLS starts from scratch. Its
+// directory, however, may still be in use by an HLSFile call already past
+// the map lookup (e.g. ffmpeg writing seg<n>.ts.tmp.ts), so the RemoveAll is
+// deferred until inFlight drops to 0:
+//
+//   - HLSFile only increments inFlight while holding m.mu *and* finding the
+//     session in m.sessions. DeleteHLS unregisters it under m.mu, so once
+//     DeleteHLS releases m.mu inFlight can only go down.
+//   - DeleteHLS sets deleted before loading inFlight; HLSFile's deferred exit
+//     decrements inFlight before loading deleted. Both are sequentially
+//     consistent atomics, so at least one side sees the other's write: either
+//     DeleteHLS reads inFlight == 0 (and removes the directory itself), or
+//     the exit that takes inFlight to 0 reads deleted == true (and removes
+//     it). Both may see it, hence removeDeletedSession's once-only guard.
+//
+// Until the directory is gone the id stays in m.draining, which makes
+// StartHLS refuse to re-create it: a new session would reuse the same
+// <base>/<id> directory and be wiped by the pending RemoveAll.
+//
+// Returns an error wrapping types.ErrHLSInvalidSessionID for an id StartHLS
+// would reject, or types.ErrHLSSessionNotFound when no such session exists.
+func (m *hlsManager) DeleteHLS(id string) error {
+	if !validSessionID(id) {
+		return fmt.Errorf("hls: %w %q", types.ErrHLSInvalidSessionID, id)
+	}
+	m.mu.Lock()
+	s, ok := m.sessions[id]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("hls: %w %s", types.ErrHLSSessionNotFound, id)
+	}
+	delete(m.sessions, id)
+	if m.draining == nil {
+		m.draining = map[string]*hlsSession{}
+	}
+	m.draining[id] = s
+	s.deleted.Store(true)
+	idle := s.inFlight.Load() == 0
+	m.mu.Unlock()
+
+	if idle {
+		m.removeDeletedSession(id, s)
+	} else {
+		logging.For("media").Debug("hls session deleted; removal deferred until in-flight requests finish", "id", id)
+	}
+	return nil
+}
+
+// removeDeletedSession removes a session's directory after DeleteHLS, exactly
+// once (the removed CAS), then drops it from m.draining so StartHLS may reuse
+// the id. The RemoveAll happens before the draining entry is cleared, so no
+// new session for the same id can create its directory in between.
+func (m *hlsManager) removeDeletedSession(id string, s *hlsSession) {
+	if !s.removed.CompareAndSwap(false, true) {
+		return
+	}
+	if err := os.RemoveAll(s.dir); err != nil {
+		logging.For("media").Warn("hls session dir removal failed", "id", id, "err", err)
+	}
+	m.mu.Lock()
+	if m.draining[id] == s {
+		delete(m.draining, id)
+	}
+	m.mu.Unlock()
 }
 
 // reaper is the single background goroutine that evicts idle HLS sessions.
@@ -1511,6 +1616,10 @@ func (m *hlsManager) reaper() {
 // every subsequent request. Deleting from a map during range is safe and
 // defined in Go.
 func (m *hlsManager) evictIdle() {
+	if m.cfg.DisableIdleEviction {
+		// STREMIO_HLS_SESSION_TTL=0: sessions live until DeleteHLS/CloseHLS.
+		return
+	}
 	cutoff := time.Now().Add(-m.cfg.SessionTTL)
 	var victims []string
 	m.mu.Lock()
@@ -1572,6 +1681,7 @@ func (p *prober) StartHLS(id, mediaURL string) (string, error) { return p.hls.St
 func (p *prober) HLSFile(ctx context.Context, id, name string) (string, string, error) {
 	return p.hls.HLSFile(ctx, id, name)
 }
+func (p *prober) DeleteHLS(id string) error { return p.hls.DeleteHLS(id) }
 
 // CloseHLS stops the background session reaper and removes all HLS working
 // directories.  Not part of types.MediaProber; call directly on shutdown.

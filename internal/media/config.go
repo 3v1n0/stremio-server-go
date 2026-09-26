@@ -23,6 +23,13 @@ type HLSConfig struct {
 	PosProbeTTL    time.Duration // successful-probe cache TTL (STREMIO_HLS_POS_PROBE_TTL)
 	MaxSessions    int           // hard cap on concurrent sessions (STREMIO_HLS_MAX_SESSIONS)
 	WorkDir        string        // "" = os.MkdirTemp default; else stremio-hls-* under it (STREMIO_HLS_WORK_DIR)
+	// DisableIdleEviction turns idle eviction off entirely: the reaper never
+	// removes a session for being idle, so sessions live until DeleteHLS (or
+	// CloseHLS). internal/app sets it for STREMIO_HLS_SESSION_TTL=0, matching
+	// STREMIO_TORRENT_IDLE_TIMEOUT=0. A separate flag rather than
+	// SessionTTL==0 because normalize treats a zero SessionTTL as "unset" (a
+	// caller-built HLSConfig literal), which must keep meaning the 60s default.
+	DisableIdleEviction bool
 
 	// --- output quality / bandwidth ---
 	VideoBitrate string // -b:v, e.g. "8M" (STREMIO_TRANSCODE_VIDEO_BITRATE)
@@ -128,6 +135,11 @@ func DefaultHLSConfig() HLSConfig {
 // explicit override (issue #20: "Should probably scale with the TTL above"),
 // giving the derivation a single, unit-tested home instead of duplicating it
 // in internal/app.
+//
+// A zero (or negative) ttl yields the historical 30s rather than 0: ttl==0
+// is how STREMIO_HLS_SESSION_TTL=0 ("never evict", see
+// HLSConfig.DisableIdleEviction) reaches here, and a 0 interval would make
+// time.NewTicker panic, while a tiny one would spin the reaper.
 func DefaultReaperInterval(ttl time.Duration) time.Duration {
 	half := ttl / 2
 	if half <= 0 || half > defaultReaperInterval {

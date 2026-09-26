@@ -6,6 +6,7 @@ package types
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"time"
 )
@@ -296,4 +297,22 @@ type MediaProber interface {
 	// HLSFile returns the filesystem path and content-type for a file in the
 	// HLS session (playlist or .ts segment).
 	HLSFile(ctx context.Context, id, name string) (path, contentType string, err error)
+	// DeleteHLS removes HLS session id: it is unregistered immediately (so
+	// later StartHLS/HLSFile calls see an unknown session) and its segment
+	// cache is removed from disk once no HLSFile call for it is still in
+	// flight. Returns an error wrapping ErrHLSInvalidSessionID for an id
+	// StartHLS would reject, or ErrHLSSessionNotFound when no such session
+	// exists.
+	DeleteHLS(id string) error
 }
+
+// Sentinel errors returned (wrapped) by MediaProber's HLS methods, so the
+// HTTP layer can map them to status codes with errors.Is without importing
+// the concrete media package.
+var (
+	// ErrHLSSessionNotFound reports that no HLS session exists for an id.
+	ErrHLSSessionNotFound = errors.New("unknown session")
+	// ErrHLSInvalidSessionID reports an HLS session id that is empty or could
+	// escape the HLS working directory (path traversal).
+	ErrHLSInvalidSessionID = errors.New("invalid session id")
+)

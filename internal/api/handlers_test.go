@@ -5,14 +5,19 @@ package api
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/M0Rf30/stremio-server-go/internal/archive"
 	"github.com/M0Rf30/stremio-server-go/internal/nzb"
+	"github.com/M0Rf30/stremio-server-go/internal/types"
 )
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -196,6 +201,107 @@ func TestHandlerHLS_TooFewSegments404(t *testing.T) {
 	rec := serve(t, h, http.MethodGet, "/hlsv2", nil)
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("/hlsv2 (no sub-path) status = %d; want 404", rec.Code)
+	}
+}
+
+// ─── DELETE /hlsv2/{id} ──────────────────────────────────────────────────────
+
+func newHandlerWithProber(t *testing.T, p *fakeProber) http.Handler {
+	t.Helper()
+	cfg := types.Config{
+		HTTPPort:           11470,
+		WebUI:              "https://web.stremio.com/",
+		CreateMetadataWait: 90 * time.Second,
+	}
+	return New(newFakeEM(), &fakeSS{}, p, cfg)
+}
+
+func TestHandlerHLSDelete(t *testing.T) {
+	cases := []struct {
+		name        string
+		path        string
+		deleteErr   error
+		wantCode    int
+		wantDeleted []string // ids DeleteHLS must have been called with
+	}{
+		{"success", "/hlsv2/sess1", nil, http.StatusNoContent, []string{"sess1"}},
+		{"trailing slash", "/hlsv2/sess1/", nil, http.StatusNoContent, []string{"sess1"}},
+		{"unknown session", "/hlsv2/nope", fmt.Errorf("hls: %w nope", types.ErrHLSSessionNotFound), http.StatusNotFound, []string{"nope"}},
+		{"invalid id", "/hlsv2/a..b", fmt.Errorf("hls: %w %q", types.ErrHLSInvalidSessionID, "a..b"), http.StatusBadRequest, []string{"a..b"}},
+		{"other error", "/hlsv2/sess1", errors.New("disk on fire"), http.StatusInternalServerError, []string{"sess1"}},
+		{"no id", "/hlsv2", nil, http.StatusNotFound, nil},
+		{"file path is not deletable", "/hlsv2/sess1/seg0.ts", nil, http.StatusNotFound, nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := &fakeProber{deleteHLS: func(string) error { return c.deleteErr }}
+			rec := serve(t, newHandlerWithProber(t, p), http.MethodDelete, c.path, nil)
+			if rec.Code != c.wantCode {
+				t.Errorf("DELETE %s status = %d; want %d (body %q)", c.path, rec.Code, c.wantCode, rec.Body.String())
+			}
+			if c.wantCode == http.StatusNoContent && rec.Body.Len() != 0 {
+				t.Errorf("204 response must have an empty body, got %q", rec.Body.String())
+			}
+			if strings.Join(p.deleted, ",") != strings.Join(c.wantDeleted, ",") {
+				t.Errorf("DeleteHLS called with %q; want %q", p.deleted, c.wantDeleted)
+			}
+		})
+	}
+}
+
+func TestHandlerHLSDeleteDoesNotAffectGet(t *testing.T) {
+	p := &fakeProber{}
+	h := newHandlerWithProber(t, p)
+	rec := serve(t, h, http.MethodGet, "/hlsv2/sess1/master.m3u8?mediaURL=http://example.com", nil)
+	if rec.Code != http.StatusOK {
+		t.Errorf("GET master.m3u8 status = %d; want 200", rec.Code)
+	}
+	if len(p.deleted) != 0 {
+		t.Errorf("GET must not call DeleteHLS, got %q", p.deleted)
+	}
+}
+
+func TestHandlerHLSDeleteOriginGate(t *testing.T) {
+	cases := []struct {
+		name       string
+		origin     string
+		wantCode   int
+		wantCalled bool
+	}{
+		{"no origin (native client/curl)", "", http.StatusNoContent, true},
+		{"allowed origin", "https://web.stremio.com", http.StatusNoContent, true},
+		{"disallowed origin", "https://evil.example.com", http.StatusForbidden, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := &fakeProber{}
+			req := httptest.NewRequest(http.MethodDelete, "/hlsv2/sess1", nil)
+			if c.origin != "" {
+				req.Header.Set("Origin", c.origin)
+			}
+			rec := httptest.NewRecorder()
+			newHandlerWithProber(t, p).ServeHTTP(rec, req)
+			if rec.Code != c.wantCode {
+				t.Errorf("status = %d; want %d", rec.Code, c.wantCode)
+			}
+			if called := len(p.deleted) > 0; called != c.wantCalled {
+				t.Errorf("DeleteHLS called = %v; want %v", called, c.wantCalled)
+			}
+		})
+	}
+}
+
+func TestHandlerCORSPreflightAllowsDelete(t *testing.T) {
+	req := httptest.NewRequest(http.MethodOptions, "/hlsv2/sess1", nil)
+	req.Header.Set("Origin", "https://web.stremio.com")
+	req.Header.Set("Access-Control-Request-Method", http.MethodDelete)
+	rec := httptest.NewRecorder()
+	newHandler(t).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("preflight status = %d; want 200", rec.Code)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Methods"); got != "POST, GET, DELETE, OPTIONS" {
+		t.Errorf("Access-Control-Allow-Methods = %q; want %q", got, "POST, GET, DELETE, OPTIONS")
 	}
 }
 

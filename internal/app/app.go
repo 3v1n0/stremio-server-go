@@ -611,6 +611,13 @@ func isLoopbackAddr(addr string) bool {
 // session-creation time — see media.HLSConfig and effectiveSessionConfig.
 func hlsConfig(lookup Lookup) media.HLSConfig {
 	d := media.DefaultHLSConfig()
+	// envDuration keeps unset/negative/invalid at the 60s default but returns
+	// an explicit "0" (or "0s") as 0, which means "never evict idle sessions"
+	// (sessions then live until DELETE /hlsv2/{id}), like
+	// STREMIO_TORRENT_IDLE_TIMEOUT=0. SessionTTL itself stays 0 here;
+	// media's normalize resolves it back to the default, which is harmless
+	// because DisableIdleEviction short-circuits the reaper, and
+	// DefaultReaperInterval(0) keeps the 30s tick instead of a zero interval.
 	sessionTTL := envDuration(lookup, "STREMIO_HLS_SESSION_TTL", d.SessionTTL)
 	maxWidth := envInt(lookup, "STREMIO_TRANSCODE_MAX_WIDTH", d.MaxWidth)
 	if maxWidth < 0 {
@@ -629,6 +636,8 @@ func hlsConfig(lookup Lookup) media.HLSConfig {
 		PosProbeTTL:    envDuration(lookup, "STREMIO_HLS_POS_PROBE_TTL", d.PosProbeTTL),
 		MaxSessions:    envInt(lookup, "STREMIO_HLS_MAX_SESSIONS", d.MaxSessions),
 		WorkDir:        getenv(lookup, "STREMIO_HLS_WORK_DIR", d.WorkDir),
+
+		DisableIdleEviction: sessionTTL == 0,
 
 		VideoBitrate: envBitrate(lookup, "STREMIO_TRANSCODE_VIDEO_BITRATE", d.VideoBitrate),
 		VideoMaxrate: envBitrate(lookup, "STREMIO_TRANSCODE_MAXRATE", d.VideoMaxrate),

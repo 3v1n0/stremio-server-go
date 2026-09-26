@@ -157,8 +157,13 @@ func (s *fakeSS) Get(key string) any {
 }
 func (s *fakeSS) Save() error { return nil }
 
-// fakeProber implements types.MediaProber with no-op methods.
-type fakeProber struct{}
+// fakeProber implements types.MediaProber with no-op methods. deleteHLS, when
+// set, backs DeleteHLS (nil = succeed); deleted records every id DeleteHLS
+// was called with.
+type fakeProber struct {
+	deleteHLS func(id string) error
+	deleted   []string
+}
 
 func (p *fakeProber) Probe(_ string) (any, error)                          { return map[string]any{}, nil }
 func (p *fakeProber) Tracks(_ string) (any, error)                         { return []any{}, nil }
@@ -168,6 +173,13 @@ func (p *fakeProber) WriteSubtitles(_ io.Writer, _, _ string, _ int) error { ret
 func (p *fakeProber) StartHLS(_, _ string) (string, error)                 { return "", nil }
 func (p *fakeProber) HLSFile(_ context.Context, _, _ string) (string, string, error) {
 	return "", "", nil
+}
+func (p *fakeProber) DeleteHLS(id string) error {
+	p.deleted = append(p.deleted, id)
+	if p.deleteHLS != nil {
+		return p.deleteHLS(id)
+	}
+	return nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
