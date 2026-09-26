@@ -34,6 +34,7 @@ type HLSConfig struct {
 	// --- encoder tuning ---
 	VAAPIQP     int    // -qp for h264_vaapi (STREMIO_TRANSCODE_VAAPI_QP)
 	NVENCPreset string // -preset for h264_nvenc (STREMIO_TRANSCODE_NVENC_PRESET)
+	QSVPreset   string // -preset for h264_qsv (STREMIO_TRANSCODE_QSV_PRESET)
 	X264Preset  string // -preset for libx264 (STREMIO_TRANSCODE_X264_PRESET)
 	X264CRF     int    // -crf for libx264 (STREMIO_TRANSCODE_X264_CRF)
 
@@ -65,6 +66,7 @@ const (
 	defaultVideoBufsize   = "16M"
 	defaultVAAPIQP        = 23
 	defaultNVENCPreset    = "p4"
+	defaultQSVPreset      = "veryfast"
 	defaultX264Preset     = "veryfast"
 	defaultX264CRF        = 23
 	defaultAudioChannels  = 2
@@ -107,6 +109,7 @@ func DefaultHLSConfig() HLSConfig {
 		MaxHeight:          0,
 		VAAPIQP:            defaultVAAPIQP,
 		NVENCPreset:        defaultNVENCPreset,
+		QSVPreset:          defaultQSVPreset,
 		X264Preset:         defaultX264Preset,
 		X264CRF:            defaultX264CRF,
 		AudioChannels:      defaultAudioChannels,
@@ -168,6 +171,9 @@ func (c HLSConfig) normalize(numCPU int) HLSConfig {
 	}
 	if c.NVENCPreset == "" {
 		c.NVENCPreset = d.NVENCPreset
+	}
+	if c.QSVPreset == "" {
+		c.QSVPreset = d.QSVPreset
 	}
 	if c.X264Preset == "" {
 		c.X264Preset = d.X264Preset
@@ -268,6 +274,7 @@ type sessionConfig struct {
 	hwEnabled    bool
 	x264Preset   string
 	nvencPreset  string
+	qsvPreset    string
 }
 
 // x264PresetOrder lists every libx264 preset name from fastest/lowest-quality
@@ -304,6 +311,22 @@ func nvencPresetForX264(x264Preset string) string {
 	}
 }
 
+// qsvPresetForX264 maps a libx264 preset name to the closest h264_qsv
+// preset, mirroring nvencPresetForX264 so one transcodeProfile value drives
+// every encoder consistently. h264_qsv accepts the x264 names from
+// veryfast down to veryslow, so those pass through unchanged;
+// ultrafast/superfast (no QSV equivalent) map to veryfast, the existing QSV
+// default, so leaving transcodeProfile unset (or at "veryfast") changes
+// nothing.
+func qsvPresetForX264(x264Preset string) string {
+	switch x264Preset {
+	case "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow":
+		return x264Preset
+	default: // ultrafast, superfast, or anything unrecognized
+		return defaultQSVPreset
+	}
+}
+
 // isKnownX264Preset reports whether profile is one of x264PresetOrder.
 func isKnownX264Preset(profile string) bool {
 	for _, p := range x264PresetOrder {
@@ -333,7 +356,9 @@ func isKnownX264Preset(profile string) bool {
 //     encoding for this session; true (default) preserves the existing
 //     auto-detected m.enc behaviour unchanged.
 //   - transcodeProfile (settings default nil): a recognized libx264 preset
-//     name overrides both X264Preset and (mapped) NVENCPreset.
+//     name overrides X264Preset and, mapped to each encoder's closest
+//     preset, NVENCPreset and QSVPreset (see nvencPresetForX264,
+//     qsvPresetForX264). An unrecognized name is ignored for all three.
 func (m *hlsManager) effectiveSessionConfig() sessionConfig {
 	cfg := m.cfg
 	sc := sessionConfig{
@@ -345,6 +370,7 @@ func (m *hlsManager) effectiveSessionConfig() sessionConfig {
 		hwEnabled:    true,
 		x264Preset:   cfg.X264Preset,
 		nvencPreset:  cfg.NVENCPreset,
+		qsvPreset:    cfg.QSVPreset,
 	}
 	sc.maxrateBps, _ = parseFFmpegBitrate(cfg.VideoMaxrate)
 
@@ -370,6 +396,7 @@ func (m *hlsManager) effectiveSessionConfig() sessionConfig {
 		if isKnownX264Preset(profile) {
 			sc.x264Preset = profile
 			sc.nvencPreset = nvencPresetForX264(profile)
+			sc.qsvPreset = qsvPresetForX264(profile)
 		}
 	}
 

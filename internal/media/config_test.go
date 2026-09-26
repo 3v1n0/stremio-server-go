@@ -42,6 +42,7 @@ func TestDefaultHLSConfigMatchesHistoricalConstants(t *testing.T) {
 		"MaxHeight":      d.MaxHeight == 0,
 		"VAAPIQP":        d.VAAPIQP == 23,
 		"NVENCPreset":    d.NVENCPreset == "p4",
+		"QSVPreset":      d.QSVPreset == "veryfast",
 		"X264Preset":     d.X264Preset == "veryfast",
 		"X264CRF":        d.X264CRF == 23,
 		"AudioChannels":  d.AudioChannels == 2,
@@ -305,8 +306,8 @@ func TestEffectiveSessionConfigDefaultsWhenSettingsUntouched(t *testing.T) {
 	if !sc.hwEnabled {
 		t.Error("transcodeHardwareAccel=true (default) must preserve auto hw behaviour (hwEnabled=true)")
 	}
-	if sc.x264Preset != "veryfast" || sc.nvencPreset != "p4" {
-		t.Errorf("untouched transcodeProfile changed preset config: x264=%q nvenc=%q", sc.x264Preset, sc.nvencPreset)
+	if sc.x264Preset != "veryfast" || sc.nvencPreset != "p4" || sc.qsvPreset != "veryfast" {
+		t.Errorf("untouched transcodeProfile changed preset config: x264=%q nvenc=%q qsv=%q", sc.x264Preset, sc.nvencPreset, sc.qsvPreset)
 	}
 	// DefaultHLSConfig() (used unnormalized here) leaves SegmentConcurrency
 	// at its 0 sentinel; currentConcurrency() floors that to 1 regardless —
@@ -341,8 +342,8 @@ func TestEffectiveSessionConfigAppliesExplicitOverrides(t *testing.T) {
 	if sc.hwEnabled {
 		t.Error("transcodeHardwareAccel=false must disable hw for this session")
 	}
-	if sc.x264Preset != "slow" || sc.nvencPreset != "p6" {
-		t.Errorf("transcodeProfile=slow mapping wrong: x264=%q nvenc=%q", sc.x264Preset, sc.nvencPreset)
+	if sc.x264Preset != "slow" || sc.nvencPreset != "p6" || sc.qsvPreset != "slow" {
+		t.Errorf("transcodeProfile=slow mapping wrong: x264=%q nvenc=%q qsv=%q", sc.x264Preset, sc.nvencPreset, sc.qsvPreset)
 	}
 	if got := m.currentConcurrency(); got != 4 {
 		t.Errorf("currentConcurrency() = %d, want 4 (explicit transcodeConcurrency override)", got)
@@ -360,8 +361,8 @@ func TestEffectiveSessionConfigNilSettings(t *testing.T) {
 func TestEffectiveSessionConfigUnknownProfileIgnored(t *testing.T) {
 	m := &hlsManager{cfg: DefaultHLSConfig(), settings: stubSettings{"transcodeProfile": "turbo-mode"}}
 	sc := m.effectiveSessionConfig()
-	if sc.x264Preset != "veryfast" || sc.nvencPreset != "p4" {
-		t.Errorf("unrecognized transcodeProfile must be ignored, got x264=%q nvenc=%q", sc.x264Preset, sc.nvencPreset)
+	if sc.x264Preset != "veryfast" || sc.nvencPreset != "p4" || sc.qsvPreset != "veryfast" {
+		t.Errorf("unrecognized transcodeProfile must be ignored, got x264=%q nvenc=%q qsv=%q", sc.x264Preset, sc.nvencPreset, sc.qsvPreset)
 	}
 }
 
@@ -549,5 +550,58 @@ func TestSettingsHelpersHandleEveryJSONShape(t *testing.T) {
 	}
 	if _, ok := settingsInt(nil, "i"); ok {
 		t.Error("settingsInt(nil source) should be !ok")
+	}
+}
+
+// ── QSVPreset / transcodeProfile → QSV mapping ──────────────────────────────
+
+func TestQSVPresetForX264(t *testing.T) {
+	cases := map[string]string{
+		"ultrafast": "veryfast",
+		"superfast": "veryfast",
+		"veryfast":  "veryfast",
+		"faster":    "faster",
+		"fast":      "fast",
+		"medium":    "medium",
+		"slow":      "slow",
+		"slower":    "slower",
+		"veryslow":  "veryslow",
+		"bogus":     "veryfast",
+	}
+	for in, want := range cases {
+		if got := qsvPresetForX264(in); got != want {
+			t.Errorf("qsvPresetForX264(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestEffectiveSessionConfigQSVPresetPrecedence(t *testing.T) {
+	cases := []struct {
+		name    string
+		env     string // HLSConfig.QSVPreset ("" = default)
+		profile interface{}
+		want    string
+	}{
+		{"defaults", "", nil, "veryfast"},
+		{"env only", "slower", nil, "slower"},
+		{"profile overrides default", "", "medium", "medium"},
+		{"profile overrides env", "slower", "fast", "fast"}, // same precedence as NVENC
+		{"ultrafast profile", "slower", "ultrafast", "veryfast"},
+		{"superfast profile", "", "superfast", "veryfast"},
+		{"profile case/space-insensitive", "", " Slow ", "slow"},
+		{"unknown profile ignored", "slower", "turbo-mode", "slower"},
+		{"empty profile ignored", "slower", "", "slower"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := DefaultHLSConfig()
+			if c.env != "" {
+				cfg.QSVPreset = c.env
+			}
+			m := &hlsManager{cfg: cfg.normalize(1), settings: stubSettings{"transcodeProfile": c.profile}}
+			if got := m.effectiveSessionConfig().qsvPreset; got != c.want {
+				t.Errorf("qsvPreset = %q, want %q", got, c.want)
+			}
+		})
 	}
 }

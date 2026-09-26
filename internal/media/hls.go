@@ -1233,7 +1233,7 @@ func (m *hlsManager) transcodeSegment(ctx context.Context, s *hlsSession, n int,
 					a = append(a, "-vf", vf)
 				}
 				a = append(a,
-					"-c:v", "h264_qsv", "-preset", "veryfast",
+					"-c:v", "h264_qsv", "-preset", tc.qsvPreset,
 					"-g", gopStr,
 					"-b:v", tc.videoBitrate, "-maxrate", tc.videoMaxrate, "-bufsize", tc.videoBufsize,
 				)

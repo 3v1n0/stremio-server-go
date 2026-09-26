@@ -638,6 +638,7 @@ func hlsConfig(lookup Lookup) media.HLSConfig {
 
 		VAAPIQP:     envInt(lookup, "STREMIO_TRANSCODE_VAAPI_QP", d.VAAPIQP),
 		NVENCPreset: getenv(lookup, "STREMIO_TRANSCODE_NVENC_PRESET", d.NVENCPreset),
+		QSVPreset:   getenv(lookup, "STREMIO_TRANSCODE_QSV_PRESET", d.QSVPreset),
 		X264Preset:  getenv(lookup, "STREMIO_TRANSCODE_X264_PRESET", d.X264Preset),
 		X264CRF:     envInt(lookup, "STREMIO_TRANSCODE_X264_CRF", d.X264CRF),
 
