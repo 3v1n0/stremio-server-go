@@ -105,6 +105,7 @@ Then point any Stremio client's **streaming server URL** at
 | `STREMIO_HLS_SESSION_OVERRIDES` | _(off)_ | `1`/`true` lets the request that creates an HLS session override its idle TTL and output quality via query parameters on `GET /hlsv2/{id}/master.m3u8` (see [Per-session HLS overrides](#per-session-hls-overrides)). Off by default: the parameters are then ignored entirely. **With the gate on, clients can raise as well as lower the env and `/settings` limits; enable it only when every client that can reach the server is trusted.** |
 | `STREMIO_HLS_MAX_SESSIONS` | `64` | hard cap on simultaneously registered HLS transcode sessions. |
 | `STREMIO_HLS_WORK_DIR` | _(OS temp dir)_ | root directory for HLS segment working directories (`stremio-hls-*` created under it). Unset uses the OS default temp dir, matching prior behaviour. Set to move segment I/O onto a specific fast or large disk. |
+| `STREMIO_HLS_PERSIST` | _(off)_ | `1`/`true` keeps HLS sessions and their transcoded segments across restarts. Requires `STREMIO_HLS_WORK_DIR` and, to be useful, a much longer `STREMIO_HLS_SESSION_TTL`. See [Persistent HLS sessions](#persistent-hls-sessions). |
 | `STREMIO_HLS_VAAPI_DEVICE` | `/dev/dri/renderD128` | VAAPI render-node device path used for hardware transcoding. Override on multi-GPU hosts (e.g. `/dev/dri/renderD129`). |
 | `STREMIO_HLS_SEGMENT_TIMEOUT` | `120` | seconds (or a duration string) allowed for one `ffmpeg` segment transcode before it's killed. |
 | `STREMIO_HLS_SUBTITLE_TIMEOUT` | `120` | seconds (or a duration string) allowed for one `ffmpeg` subtitle-track extraction before it's killed. |
@@ -239,6 +240,41 @@ Dolby Vision profile 5 (no HDR10/HLG base layer) is detected and left
 untouched, since its colours are only correct after applying the DV
 reshaping this chain does not do; profiles 7/8.1/8.4 go through the HDR10 or
 HLG path via their base layer.
+### Persistent HLS sessions
+
+By default HLS sessions live in memory and in a fresh random
+`stremio-hls-*` directory that is deleted on shutdown, so a restart loses
+every transcoded segment. `STREMIO_HLS_PERSIST=1` (with
+`STREMIO_HLS_WORK_DIR` set; otherwise a warning is logged and nothing
+persists) keeps them in `<STREMIO_HLS_WORK_DIR>/stremio-hls-persist/<id>/`
+with a `session.json` each, so a front end can pre-transcode a title hours
+ahead and still have it after a restart, crash or update.
+
+- **Raise `STREMIO_HLS_SESSION_TTL`.** The TTL still applies: with the
+  default `60`, a session is evicted a minute after its last use and
+  discarded by any restart longer than a minute, which makes persistence
+  nearly useless. Set it to cover the gap between pre-transcoding and
+  watching (e.g. `12h`). A warning is logged if it's left at the default.
+- **On start**, each session is restored without re-probing and its
+  existing segments are served from disk. Sessions idle past the TTL,
+  unreadable or invalid ones, and ones whose segments no longer match the
+  current process-wide encoder settings (`STREMIO_TRANSCODE_X264_CRF`,
+  `_VAAPI_QP`, `_AUDIO_BITRATE`, `_AUDIO_CHANNELS`) are deleted, as are
+  partial `*.tmp*` files; beyond `STREMIO_HLS_MAX_SESSIONS`, the least
+  recently used are deleted. A session keeps its own bitrate/size/preset
+  snapshot, so later `/settings` or env changes to those only affect new
+  sessions, exactly as without persistence.
+- **One process per directory.** The directory is locked exclusively (flock
+  on POSIX, an exclusive open on Windows); a second server pointed at the
+  same `STREMIO_HLS_WORK_DIR` warns and runs without persistence.
+- **Security.** `session.json` holds the media URL, which can embed
+  credentials (e.g. debrid links). It's written `0600`, and the persist
+  directory and session directories are `0700`. On POSIX an existing
+  `stremio-hls-persist` that isn't owned by the server's user, or is a
+  symlink, is refused (the server falls back to non-persistent mode); one
+  that is ours but more open than `0700` is tightened to `0700`. Use a
+  dedicated `STREMIO_HLS_WORK_DIR` owned by the server's user, not a shared
+  directory such as `/tmp`.
 ### Censorship resistance
 
 The server uses DHT (BEP32), PEX (BEP11), HTTP webseeds, and a ranked public

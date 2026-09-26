@@ -636,6 +636,7 @@ func hlsConfig(lookup Lookup) media.HLSConfig {
 		PosProbeTTL:    envDuration(lookup, "STREMIO_HLS_POS_PROBE_TTL", d.PosProbeTTL),
 		MaxSessions:    envInt(lookup, "STREMIO_HLS_MAX_SESSIONS", d.MaxSessions),
 		WorkDir:        getenv(lookup, "STREMIO_HLS_WORK_DIR", d.WorkDir),
+		Persist:        envBool(lookup, "STREMIO_HLS_PERSIST", d.Persist),
 
 		DisableIdleEviction: sessionTTL == 0,
 

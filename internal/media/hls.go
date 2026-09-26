@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"os/exec"
@@ -125,6 +126,12 @@ type hlsSession struct {
 	// a caller can extend or shorten a session's lifetime without affecting
 	// how its segments are encoded.
 	ttl atomic.Int64
+	// persistedAccess is the lastAccess value (unix nanoseconds) most recently
+	// written to session.json. The reaper rewrites the file only when
+	// lastAccess has moved past it, so an idle session costs no writes and a
+	// busy one at most one write per ReaperInterval. Unused unless
+	// HLSConfig.Persist is on.
+	persistedAccess atomic.Int64
 }
 
 // idleTTL returns the idle-eviction window that applies to s: its own
@@ -190,6 +197,24 @@ type hlsManager struct {
 	// without rebuilding the primitive.
 	semHeld atomic.Int32
 	stopCh  chan struct{} // closed by CloseHLS to stop the reaper
+	// reaperWG tracks the reaper goroutine (startReaper). With persistence
+	// on, CloseHLS waits on it so its own flush is the last session.json
+	// write and a reaper flush that read an older lastAccess can't land
+	// after it.
+	reaperWG sync.WaitGroup
+	// persist is true only when HLSConfig.Persist was requested AND the
+	// stable persist directory was usable (see newHLSBase); base is then
+	// <WorkDir>/stremio-hls-persist, sessions write session.json, and
+	// CloseHLS keeps base on disk. False reproduces the historical
+	// per-process, deleted-on-close behaviour exactly.
+	persist bool
+	// persistLock holds the persist dir's exclusive lock (see
+	// lockPersistDir) for the manager's lifetime; CloseHLS releases it. Nil
+	// unless persist.
+	persistLock io.Closer
+	// probe is the ffprobe seam; nil means probeMedia. Only tests set it, so
+	// StartHLS can be exercised end to end without a real ffprobe.
+	probe func(ctx context.Context, mediaURL, selfBase string, timeout time.Duration) probeMediaResult
 }
 
 // ── encoder detection ─────────────────────────────────────────────────────────
@@ -328,7 +353,7 @@ func selectEncoder(driDevice string) hwEncoder {
 // /settings overrides at session-creation time (may be nil).
 func newHLS(selfBase string, cfg HLSConfig, settings SettingsSource) *hlsManager {
 	cfg = cfg.normalize(runtime.NumCPU())
-	base := newHLSBaseDir(cfg.WorkDir)
+	base, persist, persistLock := newHLSBase(cfg)
 	enc := selectEncoder(cfg.VAAPIDevice)
 	if enc.isHW {
 		logging.For("media").Info("HLS transcode using hardware encoder", "encoder", enc.codec, "device", enc.driDevice)
@@ -351,8 +376,16 @@ func newHLS(selfBase string, cfg HLSConfig, settings SettingsSource) *hlsManager
 		sessions:   map[string]*hlsSession{},
 		probeCache: map[string]probeCacheEntry{},
 		stopCh:     make(chan struct{}),
+		persist:    persist,
+
+		persistLock: persistLock,
 	}
-	go m.reaper()
+	if persist {
+		// Rehydrate before the reaper starts and before the manager is
+		// reachable by any request.
+		m.loadPersisted()
+	}
+	m.startReaper()
 	return m
 }
 
@@ -665,7 +698,11 @@ func (m *hlsManager) StartHLS(id, mediaURL string, opts types.HLSSessionOptions)
 		}
 		s.ttl.Store(int64(ov.ttl))
 		s.lastAccess.Store(time.Now().UnixNano())
-		_ = os.MkdirAll(s.dir, 0o755)
+		dirPerm := os.FileMode(0o755)
+		if m.persist {
+			dirPerm = 0o700 // persisted sessions outlive the process; keep them private
+		}
+		_ = os.MkdirAll(s.dir, dirPerm)
 		m.sessions[id] = s
 		if ov != (sessionOverrides{}) {
 			logging.For("media").Debug("hls session overrides applied", "id", id,
@@ -697,7 +734,7 @@ func (m *hlsManager) StartHLS(id, mediaURL string, opts types.HLSSessionOptions)
 		if hasCached && time.Now().Before(cached.expiresAt) {
 			res = cached.result
 		} else {
-			res = probeMedia(context.Background(), mediaURL, m.selfBase, m.cfg.ProbeTimeout)
+			res = m.runProbe(mediaURL)
 			m.mu.Lock()
 			if res.duration == 0 {
 				// Cache the negative result to short-circuit future probes.
@@ -748,6 +785,11 @@ func (m *hlsManager) StartHLS(id, mediaURL string, opts types.HLSSessionOptions)
 					"session", id, "transfer", res.color.transfer, "algorithm", m.tonemap)
 			}
 		}
+		// Persist right after the first successful probe, so a crash moments
+		// after creation still leaves a recoverable session behind.
+		if stored && m.persist && res.duration > 0 {
+			m.persistSession(id, s)
+		}
 	}
 
 	s.mu.RLock()
@@ -768,13 +810,6 @@ func (m *hlsManager) StartHLS(id, mediaURL string, opts types.HLSSessionOptions)
 		bandwidth:       bandwidth,
 		codecsVideo:     codecsVideo,
 	}), nil
-}
-
-// validSessionID reports whether id is safe to use as a directory name under
-// the manager's base dir: non-empty, a single path element, and free of "..".
-// Shared by StartHLS and DeleteHLS so both accept exactly the same ids.
-func validSessionID(id string) bool {
-	return id != "" && id != "." && id != ".." && id == filepath.Base(id) && !strings.Contains(id, "..")
 }
 
 // masterPlaylistInputs bundles everything buildMasterPlaylist needs,
@@ -1288,6 +1323,12 @@ func (m *hlsManager) currentConcurrency() int {
 // PQ/HLG source the video filter becomes the software zscale+tonemap chain
 // (see tonemapChain/buildVideoFilter) and BT.709 colour tags are added; all
 // other sources, and every source with the knob off, are unaffected.
+//
+// Persistence (HLSConfig.Persist): restored sessions reuse segments written
+// by an earlier process, guarded by outputFingerprint. Whenever the ffmpeg
+// arguments below change in a way that alters the output, bump
+// sessionFormatVersion (persist.go) so old segments are discarded instead of
+// being spliced with new ones.
 func (m *hlsManager) transcodeSegment(ctx context.Context, s *hlsSession, n int, kind segKind, audioIdx int) (string, error) {
 	s.mu.RLock()
 	sessionDur := s.duration
@@ -1643,6 +1684,11 @@ func videoEncodeArgs(codec string, highBitDepth bool, outW, outH int, scaled boo
 // working directory (created fresh per-manager by newHLSBaseDir in newHLS, so
 // removing it cannot affect any other manager or process). Safe to call
 // multiple times.
+//
+// With HLSConfig.Persist on (m.persist) the base directory is the stable
+// persist dir instead: CloseHLS still stops the reaper and drops the
+// in-memory sessions, but first flushes each session's lastAccess to its
+// session.json and then leaves everything on disk for the next process.
 func (m *hlsManager) CloseHLS() {
 	// Signal the reaper to stop; guard against double-close with a non-blocking
 	// drain: if stopCh is already closed the receive arm fires immediately.
@@ -1651,10 +1697,22 @@ func (m *hlsManager) CloseHLS() {
 	default:
 		close(m.stopCh)
 	}
+	if m.persist {
+		m.reaperWG.Wait()
+		m.flushAccess()
+	}
 	m.mu.Lock()
 	m.sessions = map[string]*hlsSession{}
 	m.draining = nil
+	lock := m.persistLock
+	m.persistLock = nil
 	m.mu.Unlock()
+	if m.persist {
+		if lock != nil {
+			_ = lock.Close()
+		}
+		return
+	}
 	// RemoveAll outside the lock: disk I/O must not stall concurrent requests.
 	_ = os.RemoveAll(m.base)
 }
@@ -1687,6 +1745,11 @@ func (m *hlsManager) CloseHLS() {
 //
 // Returns an error wrapping types.ErrHLSInvalidSessionID for an id StartHLS
 // would reject, or types.ErrHLSSessionNotFound when no such session exists.
+//
+// removeDeletedSession's os.RemoveAll(s.dir) removes the session's entire
+// directory, including any session.json written by persistSession (see
+// persist.go): a deleted session is therefore never rehydrated by a later
+// restart, whether persistence is on or off.
 func (m *hlsManager) DeleteHLS(id string) error {
 	if !validSessionID(id) {
 		return fmt.Errorf("hls: %w %q", types.ErrHLSInvalidSessionID, id)
@@ -1732,6 +1795,15 @@ func (m *hlsManager) removeDeletedSession(id string, s *hlsSession) {
 	m.mu.Unlock()
 }
 
+// startReaper launches the reaper goroutine, tracked by reaperWG.
+func (m *hlsManager) startReaper() {
+	m.reaperWG.Add(1)
+	go func() {
+		defer m.reaperWG.Done()
+		m.reaper()
+	}()
+}
+
 // reaper is the single background goroutine that evicts idle HLS sessions.
 // It runs until CloseHLS closes stopCh, so it never leaks.
 func (m *hlsManager) reaper() {
@@ -1741,6 +1813,9 @@ func (m *hlsManager) reaper() {
 		select {
 		case <-ticker.C:
 			m.evictIdle()
+			if m.persist {
+				m.flushAccess()
+			}
 		case <-m.stopCh:
 			return
 		}
@@ -1841,6 +1916,23 @@ func (m *hlsManager) sweepProbeCache() {
 	}
 }
 
+// runProbe probes mediaURL through the m.probe seam (probeMedia by default).
+func (m *hlsManager) runProbe(mediaURL string) probeMediaResult {
+	probe := m.probe
+	if probe == nil {
+		probe = probeMedia
+	}
+	return probe(context.Background(), mediaURL, m.selfBase, m.cfg.ProbeTimeout)
+}
+
+// validSessionID reports whether id is safe to use as a directory name under
+// the manager's base dir: non-empty, a single path element, and free of ".."
+// anywhere. Used by StartHLS for client-supplied ids and by loadPersisted for
+// directory names found on disk.
+func validSessionID(id string) bool {
+	return id != "" && id != "." && id != ".." && id == filepath.Base(id) && !strings.Contains(id, "..")
+}
+
 func ftoa(f float64) string { return strconv.FormatFloat(f, 'f', 3, 64) }
 
 // --- types.MediaProber HLS methods (delegate to the manager) ---
@@ -1854,7 +1946,8 @@ func (p *prober) HLSFile(ctx context.Context, id, name string) (string, string, 
 func (p *prober) DeleteHLS(id string) error { return p.hls.DeleteHLS(id) }
 
 // CloseHLS stops the background session reaper and removes all HLS working
-// directories.  Not part of types.MediaProber; call directly on shutdown.
+// directories (kept on disk when HLSConfig.Persist is active).  Not part of
+// types.MediaProber; call directly on shutdown.
 func (p *prober) CloseHLS() { p.hls.CloseHLS() }
 
 // Sessions returns the number of currently active HLS transcode sessions.

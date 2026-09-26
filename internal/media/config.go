@@ -40,6 +40,12 @@ type HLSConfig struct {
 	// /hlsv2/{id}/master.m3u8 (STREMIO_HLS_SESSION_OVERRIDES). false (the
 	// default) ignores those parameters entirely — see parseSessionOverrides.
 	SessionOverrides bool
+	// Persist opts in to HLS sessions that survive a restart: sessions live
+	// in a stable <WorkDir>/stremio-hls-persist directory (instead of a fresh
+	// random stremio-hls-* one), each with a session.json that lets the next
+	// process rehydrate it without re-probing or re-transcoding. Requires
+	// WorkDir; ignored (with a warning) without it. See persist.go.
+	Persist bool // (STREMIO_HLS_PERSIST)
 
 	// --- output quality / bandwidth ---
 	VideoBitrate string // -b:v, e.g. "8M" (STREMIO_TRANSCODE_VIDEO_BITRATE)
@@ -126,6 +132,7 @@ func DefaultHLSConfig() HLSConfig {
 		MaxSessions:        defaultMaxSessions,
 		WorkDir:            "",
 		SessionOverrides:   false,
+		Persist:            false,
 		VideoBitrate:       defaultVideoBitrate,
 		VideoMaxrate:       defaultVideoMaxrate,
 		VideoBufsize:       defaultVideoBufsize,
@@ -237,8 +244,9 @@ func (c HLSConfig) normalize(numCPU int) HLSConfig {
 	if c.Tonemap != "" && !IsTonemapAlgorithm(c.Tonemap) {
 		c.Tonemap = "" // unknown algorithm from a library caller: stay off
 	}
-	// MaxWidth/MaxHeight/WorkDir: 0/"" is a meaningful value (no downscale /
-	// OS-default temp dir), not "unset" — left as provided.
+	// MaxWidth/MaxHeight/WorkDir/Persist: 0/""/false is a meaningful value
+	// (no downscale / OS-default temp dir / no persistence), not "unset" —
+	// left as provided.
 	return c
 }
 
