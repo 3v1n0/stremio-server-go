@@ -159,10 +159,15 @@ func (s *fakeSS) Save() error { return nil }
 
 // fakeProber implements types.MediaProber with no-op methods. deleteHLS, when
 // set, backs DeleteHLS (nil = succeed); deleted records every id DeleteHLS
-// was called with.
+// was called with. startHLSErr, when set, is returned by StartHLS; the last
+// StartHLS options are recorded in lastHLSOpts so handler tests can assert
+// query pass-through.
 type fakeProber struct {
 	deleteHLS func(id string) error
 	deleted   []string
+
+	startHLSErr error
+	lastHLSOpts types.HLSSessionOptions
 }
 
 func (p *fakeProber) Probe(_ string) (any, error)                          { return map[string]any{}, nil }
@@ -170,7 +175,10 @@ func (p *fakeProber) Tracks(_ string) (any, error)                         { ret
 func (p *fakeProber) OpenSubHash(_ string) (any, error)                    { return "abc123", nil }
 func (p *fakeProber) SubtitlesTracks(_ string) (any, error)                { return []any{}, nil }
 func (p *fakeProber) WriteSubtitles(_ io.Writer, _, _ string, _ int) error { return nil }
-func (p *fakeProber) StartHLS(_, _ string) (string, error)                 { return "", nil }
+func (p *fakeProber) StartHLS(_, _ string, opts types.HLSSessionOptions) (string, error) {
+	p.lastHLSOpts = opts
+	return "", p.startHLSErr
+}
 func (p *fakeProber) HLSFile(_ context.Context, _, _ string) (string, string, error) {
 	return "", "", nil
 }

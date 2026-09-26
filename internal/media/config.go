@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/M0Rf30/stremio-server-go/internal/types"
 )
 
 // HLSConfig holds every runtime-tunable knob for the HLS transcode manager
@@ -29,7 +31,15 @@ type HLSConfig struct {
 	// STREMIO_TORRENT_IDLE_TIMEOUT=0. A separate flag rather than
 	// SessionTTL==0 because normalize treats a zero SessionTTL as "unset" (a
 	// caller-built HLSConfig literal), which must keep meaning the 60s default.
+	// An explicit per-session ttl (see SessionOverrides) still wins over this
+	// flag: evictIdle evicts a session that carries its own ttl even while
+	// global idle eviction is disabled — see evictIdle.
 	DisableIdleEviction bool
+	// SessionOverrides opts in to the per-session query overrides (ttl,
+	// maxWidth, maxHeight, bitrate, maxRate, bufSize) on GET
+	// /hlsv2/{id}/master.m3u8 (STREMIO_HLS_SESSION_OVERRIDES). false (the
+	// default) ignores those parameters entirely — see parseSessionOverrides.
+	SessionOverrides bool
 
 	// --- output quality / bandwidth ---
 	VideoBitrate string // -b:v, e.g. "8M" (STREMIO_TRANSCODE_VIDEO_BITRATE)
@@ -115,6 +125,7 @@ func DefaultHLSConfig() HLSConfig {
 		PosProbeTTL:        defaultPosProbeTTL,
 		MaxSessions:        defaultMaxSessions,
 		WorkDir:            "",
+		SessionOverrides:   false,
 		VideoBitrate:       defaultVideoBitrate,
 		VideoMaxrate:       defaultVideoMaxrate,
 		VideoBufsize:       defaultVideoBufsize,
@@ -296,6 +307,13 @@ type sessionConfig struct {
 	x264Preset   string
 	nvencPreset  string
 	qsvPreset    string
+	// overridden is true when a per-session quality override (bitrate,
+	// maxrate, bufsize, maxWidth or maxHeight — not ttl) was applied. It
+	// takes the session off deriveBandwidthCodecs's legacy-compatibility
+	// path: a caller who explicitly asked for a quality gets BANDWIDTH/CODECS
+	// derived from what it asked for, even if that happens to equal the
+	// historical defaults.
+	overridden bool
 }
 
 // x264PresetOrder lists every libx264 preset name from fastest/lowest-quality
@@ -360,7 +378,10 @@ func isKnownX264Preset(profile string) bool {
 
 // effectiveSessionConfig computes the per-session transcode configuration at
 // session-creation time (StartHLS), applying live /settings overrides on top
-// of m.cfg's env-resolved defaults. Precedence, per key:
+// of m.cfg's env-resolved defaults, then the session's own query overrides
+// (ov; zero value when STREMIO_HLS_SESSION_OVERRIDES is off or none were
+// given) on top of both. Overall precedence: per-session override >
+// /settings > env. Per key:
 //
 //   - transcodeMaxBitRate (settings default 0 = "unset"): overrides
 //     videoBitrate/videoMaxrate/videoBufsize (bufsize = 2x) when > 0.
@@ -380,7 +401,19 @@ func isKnownX264Preset(profile string) bool {
 //     name overrides X264Preset and, mapped to each encoder's closest
 //     preset, NVENCPreset and QSVPreset (see nvencPresetForX264,
 //     qsvPresetForX264). An unrecognized name is ignored for all three.
-func (m *hlsManager) effectiveSessionConfig() sessionConfig {
+//   - per-session bitrate (?bitrate=): overrides videoBitrate and, unless
+//     also given explicitly, videoMaxrate (= bitrate) and videoBufsize
+//     (= 2x bitrate) — mirroring transcodeMaxBitRate's derivation — beating
+//     both transcodeMaxBitRate and the STREMIO_TRANSCODE_* env values.
+//   - per-session maxRate/bufSize (?maxRate=, ?bufSize=): override just that
+//     value (maxrate also drives BANDWIDTH); a lone maxRate/bufSize leaves
+//     the /settings- or env-resolved bitrate alone.
+//   - per-session maxWidth/maxHeight (?maxWidth=, ?maxHeight=): override
+//     transcodeMaxWidth and STREMIO_TRANSCODE_MAX_WIDTH/HEIGHT for that
+//     axis; the other axis keeps its /settings/env value.
+//   - per-session ttl is not a transcode knob; StartHLS stores it on the
+//     session itself (hlsSession.ttl) for evictIdle.
+func (m *hlsManager) effectiveSessionConfig(ov sessionOverrides) sessionConfig {
 	cfg := m.cfg
 	sc := sessionConfig{
 		videoBitrate: cfg.VideoBitrate,
@@ -421,7 +454,210 @@ func (m *hlsManager) effectiveSessionConfig() sessionConfig {
 		}
 	}
 
+	// Per-session overrides last, so they win over /settings and env.
+	if ov.videoBitrate > 0 {
+		sc.videoBitrate = strconv.FormatInt(ov.videoBitrate, 10)
+		sc.videoMaxrate = sc.videoBitrate
+		sc.videoBufsize = strconv.FormatInt(ov.videoBitrate*2, 10)
+		sc.maxrateBps = ov.videoBitrate
+	}
+	if ov.videoMaxrate > 0 {
+		sc.videoMaxrate = strconv.FormatInt(ov.videoMaxrate, 10)
+		sc.maxrateBps = ov.videoMaxrate
+	}
+	if ov.videoBufsize > 0 {
+		sc.videoBufsize = strconv.FormatInt(ov.videoBufsize, 10)
+	}
+	if ov.maxWidth > 0 {
+		sc.maxWidth = ov.maxWidth
+	}
+	if ov.maxHeight > 0 {
+		sc.maxHeight = ov.maxHeight
+	}
+	sc.overridden = ov.hasQuality()
+
 	return sc
+}
+
+// ── per-session overrides (STREMIO_HLS_SESSION_OVERRIDES) ──────────────────
+
+// Bounds for the per-session query overrides. Deliberately generous (they
+// exist to reject nonsense and typos, not to second-guess the caller) but
+// finite, so one request can't pin a session slot for a year or ask ffmpeg
+// for a 100k-pixel-wide frame. The TTL floor is the historical default
+// session TTL: a player with a full buffer can go well over a few seconds
+// between fetches, so a shorter TTL would let the reaper evict a session
+// mid-playback. An override can therefore never make a session less durable
+// than stock behaviour.
+const (
+	minOverrideTTL     = defaultSessionTTL
+	maxOverrideTTL     = 30 * 24 * time.Hour
+	minOverrideDim     = 16
+	maxOverrideDim     = 7680
+	minOverrideBitrate = 100_000     // 100k
+	maxOverrideBitrate = 200_000_000 // 200M
+	maxOverrideBufsize = 2 * maxOverrideBitrate
+)
+
+// sessionOverrides is the parsed, validated form of types.HLSSessionOptions.
+// Every zero field means "not given" (the corresponding value then comes from
+// /settings or env as usual).
+type sessionOverrides struct {
+	ttl          time.Duration
+	maxWidth     int
+	maxHeight    int
+	videoBitrate int64 // bits/second
+	videoMaxrate int64 // bits/second
+	videoBufsize int64 // bits
+}
+
+// hasQuality reports whether any override that changes the encoded output
+// (everything except ttl) is set.
+func (o sessionOverrides) hasQuality() bool {
+	return o.maxWidth > 0 || o.maxHeight > 0 ||
+		o.videoBitrate > 0 || o.videoMaxrate > 0 || o.videoBufsize > 0
+}
+
+// parseSessionOverrides validates the raw master.m3u8 query overrides.
+// Empty fields are "not given". Any malformed or out-of-range value fails
+// the whole request with an error wrapping types.ErrInvalidHLSOption (the
+// API maps it to 400) rather than being silently dropped, so a caller never
+// gets a session that quietly ignored the quality it asked for.
+//
+//   - ttl: whole seconds or a Go duration string (the same syntax as the
+//     STREMIO_HLS_* duration env knobs), >= 60s (minOverrideTTL) and <= 30
+//     days.
+//   - maxWidth/maxHeight: integers in [16, 7680], rounded down to even (the
+//     yuv420p/nv12 encoders need even dimensions; computeScaledDims keeps
+//     the actual output even as well).
+//   - bitrate/maxRate: ffmpeg bitrate syntax, decimals allowed
+//     (parseDecimalBitrate), in [100k, 200M]; bufSize: same syntax in
+//     [100k, 400M] (2x the bitrate cap). When bitrate and maxRate are both
+//     given, maxRate must be >= bitrate.
+func parseSessionOverrides(opts types.HLSSessionOptions) (sessionOverrides, error) {
+	var o sessionOverrides
+	if v := strings.TrimSpace(opts.TTL); v != "" {
+		d, ok := parseSecondsOrDuration(v)
+		if !ok || d < minOverrideTTL || d > maxOverrideTTL {
+			return sessionOverrides{}, fmt.Errorf("%w: ttl %q: want whole seconds or a Go duration (e.g. 3600, 90m) between %s and %s",
+				types.ErrInvalidHLSOption, v, minOverrideTTL, maxOverrideTTL)
+		}
+		o.ttl = d
+	}
+	var err error
+	if o.maxWidth, err = parseOverrideDim("maxWidth", opts.MaxWidth); err != nil {
+		return sessionOverrides{}, err
+	}
+	if o.maxHeight, err = parseOverrideDim("maxHeight", opts.MaxHeight); err != nil {
+		return sessionOverrides{}, err
+	}
+	if o.videoBitrate, err = parseOverrideBitrate("bitrate", opts.Bitrate, maxOverrideBitrate); err != nil {
+		return sessionOverrides{}, err
+	}
+	if o.videoMaxrate, err = parseOverrideBitrate("maxRate", opts.MaxRate, maxOverrideBitrate); err != nil {
+		return sessionOverrides{}, err
+	}
+	if o.videoBufsize, err = parseOverrideBitrate("bufSize", opts.BufSize, maxOverrideBufsize); err != nil {
+		return sessionOverrides{}, err
+	}
+	if o.videoBitrate > 0 && o.videoMaxrate > 0 && o.videoMaxrate < o.videoBitrate {
+		return sessionOverrides{}, fmt.Errorf("%w: maxRate %q is below bitrate %q; maxRate must be at least the bitrate",
+			types.ErrInvalidHLSOption, strings.TrimSpace(opts.MaxRate), strings.TrimSpace(opts.Bitrate))
+	}
+	return o, nil
+}
+
+func parseOverrideDim(name, raw string) (int, error) {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < minOverrideDim || n > maxOverrideDim {
+		return 0, fmt.Errorf("%w: %s %q: want an integer between %d and %d",
+			types.ErrInvalidHLSOption, name, v, minOverrideDim, maxOverrideDim)
+	}
+	return n - n%2, nil
+}
+
+func parseOverrideBitrate(name, raw string, maxBps int64) (int64, error) {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return 0, nil
+	}
+	n, ok := parseDecimalBitrate(v)
+	if !ok || n < minOverrideBitrate || n > maxBps {
+		return 0, fmt.Errorf("%w: %s %q: want an ffmpeg bitrate (a number with an optional k/M/G suffix, e.g. 6M or 1.5M) between %s and %s",
+			types.ErrInvalidHLSOption, name, v, formatBitrate(minOverrideBitrate), formatBitrate(maxBps))
+	}
+	return n, nil
+}
+
+// decimalBitrateRe is the bitrate syntax internal/app's envBitrate accepts
+// for the STREMIO_TRANSCODE_* rate knobs (its ffmpegBitrateRe, duplicated
+// because internal/app imports this package): an integer or decimal number
+// with an optional k/K/m/M/g/G (SI, decimal) suffix. Keeping the two in step
+// means a value accepted in the env is accepted as a per-session override.
+var decimalBitrateRe = regexp.MustCompile(`^([0-9]+(?:\.[0-9]+)?)([kKmMgG]?)$`)
+
+// parseDecimalBitrate converts a decimalBitrateRe value ("1.5M", "800k",
+// "6000000") to whole bits/second, rounding to the nearest integer. ok is
+// false for anything outside that syntax or too large to represent. Used
+// only for the per-session overrides, whose result is canonicalised to an
+// integer string before it reaches ffmpeg; parseFFmpegBitrate (integers
+// only) is left unchanged so env-derived BANDWIDTH stays byte-identical.
+func parseDecimalBitrate(s string) (int64, bool) {
+	m := decimalBitrateRe.FindStringSubmatch(strings.TrimSpace(s))
+	if m == nil {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(m[1], 64)
+	if err != nil {
+		return 0, false
+	}
+	switch strings.ToLower(m[2]) {
+	case "k":
+		f *= 1e3
+	case "m":
+		f *= 1e6
+	case "g":
+		f *= 1e9
+	}
+	f = math.Round(f)
+	if f > 1e18 { // far above any accepted bound; keeps the int64 conversion safe
+		return 0, false
+	}
+	return int64(f), true
+}
+
+// formatBitrate renders bps in the shortest exact ffmpeg suffix form, for
+// error messages ("100k", "200M").
+func formatBitrate(bps int64) string {
+	switch {
+	case bps%1_000_000 == 0:
+		return strconv.FormatInt(bps/1_000_000, 10) + "M"
+	case bps%1_000 == 0:
+		return strconv.FormatInt(bps/1_000, 10) + "k"
+	}
+	return strconv.FormatInt(bps, 10)
+}
+
+// parseSecondsOrDuration accepts the same syntax as internal/app's
+// envDuration (used by every STREMIO_HLS_* duration knob): a Go duration
+// string ("90s", "2h30m") or a bare non-negative integer of whole seconds.
+// A local copy rather than a shared helper because internal/app imports
+// this package (the reverse import would cycle) and envDuration's
+// warn-and-keep-default semantics differ from the reject-with-400 needed
+// here.
+func parseSecondsOrDuration(v string) (time.Duration, bool) {
+	if d, err := time.ParseDuration(v); err == nil {
+		return d, true
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 || n > math.MaxInt64/int64(time.Second) {
+		return 0, false
+	}
+	return time.Duration(n) * time.Second, true
 }
 
 // isDefault reports whether sc matches the fully-unconfigured (no env
@@ -451,15 +687,19 @@ func parseFFmpegBitrate(s string) (int64, bool) {
 	if err != nil {
 		return 0, false
 	}
+	var mult int64 = 1
 	switch strings.ToLower(m[2]) {
 	case "k":
-		n *= 1_000
+		mult = 1_000
 	case "m":
-		n *= 1_000_000
+		mult = 1_000_000
 	case "g":
-		n *= 1_000_000_000
+		mult = 1_000_000_000
 	}
-	return n, true
+	if n > math.MaxInt64/mult {
+		return 0, false // would overflow int64 and wrap to a bogus value
+	}
+	return n * mult, true
 }
 
 // computeScaledDims applies the MaxWidth/MaxHeight downscale caps to a
@@ -529,8 +769,12 @@ func h264Level(width, height int) string {
 // actual source resolution. Otherwise BANDWIDTH = maxrateBps/2 (preserving
 // the original 8M-cap -> 4,000,000-BANDWIDTH ratio as the general rule, not
 // just the default case) and CODECS is the resolution-derived level.
+//
+// A per-session quality override (sc.overridden) always counts as
+// "configured", so it takes the derived path even when its values happen to
+// equal the defaults.
 func deriveBandwidthCodecs(sc sessionConfig, outW, outH int, downscaled bool) (bandwidth int64, codecsVideo string) {
-	if sc.isDefaultMaxrate() && !downscaled {
+	if sc.isDefaultMaxrate() && !sc.overridden && !downscaled {
 		return legacyBandwidth, legacyCodecsVideo
 	}
 	bandwidth = sc.maxrateBps / 2

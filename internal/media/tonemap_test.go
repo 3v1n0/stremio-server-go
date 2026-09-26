@@ -330,7 +330,7 @@ var allEncoderCodecs = []string{"libx264", "h264_nvenc", "h264_qsv", "h264_vaapi
 func testSessionConfig() (sessionConfig, HLSConfig) {
 	cfg := DefaultHLSConfig().normalize(1)
 	m := &hlsManager{cfg: cfg}
-	return m.effectiveSessionConfig(), cfg
+	return m.effectiveSessionConfig(sessionOverrides{}), cfg
 }
 
 func TestVideoEncodeArgsByteIdenticalWithoutTonemap(t *testing.T) {

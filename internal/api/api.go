@@ -1359,12 +1359,27 @@ func (s *server) handleHLSProbe(w http.ResponseWriter, r *http.Request) {
 // handleHLS dispatches /hlsv2/* : probe, the per-session master playlist, and
 // the live media playlist + .ts segments produced by ffmpeg.
 //
+// With STREMIO_HLS_SESSION_OVERRIDES enabled, the master.m3u8 request may
+// carry per-session overrides (ttl, maxWidth, maxHeight, bitrate, maxRate,
+// bufSize); they are passed through verbatim and validated by the prober,
+// and an invalid value is answered with 400. Names are case-sensitive:
+// unknown or mis-cased query parameters are ignored, and a repeated
+// parameter uses its first value.
+//
 // @Summary  Serve HLS playlist or segment
 // @Tags     HLS
 // @Produce  application/vnd.apple.mpegurl
-// @Param    id    path  string  true  "session id"
-// @Param    file  path  string  true  "playlist or segment"
+// @Param    id         path   string  true   "session id"
+// @Param    file       path   string  true   "playlist or segment"
+// @Param    mediaURL   query  string  false  "media URL to transcode (master.m3u8 only)"
+// @Param    ttl        query  string  false  "per-session idle TTL, seconds or Go duration, 60s to 30 days (master.m3u8 only; needs STREMIO_HLS_SESSION_OVERRIDES; also updates an existing session)"
+// @Param    maxWidth   query  integer false  "per-session max output width, 16-7680 (master.m3u8 on session creation only; needs STREMIO_HLS_SESSION_OVERRIDES)"
+// @Param    maxHeight  query  integer false  "per-session max output height, 16-7680 (master.m3u8 on session creation only; needs STREMIO_HLS_SESSION_OVERRIDES)"
+// @Param    bitrate    query  string  false  "per-session video bitrate, ffmpeg syntax e.g. 6M or 1.5M, 100k-200M (master.m3u8 on session creation only; needs STREMIO_HLS_SESSION_OVERRIDES)"
+// @Param    maxRate    query  string  false  "per-session video maxrate, >= bitrate when both given, default = bitrate (master.m3u8 on session creation only; needs STREMIO_HLS_SESSION_OVERRIDES)"
+// @Param    bufSize    query  string  false  "per-session video bufsize, default = 2x bitrate (master.m3u8 on session creation only; needs STREMIO_HLS_SESSION_OVERRIDES)"
 // @Success  200  {string}  string  "m3u8 / MPEG-TS / WebVTT"
+// @Failure  400  {string}  string  "invalid per-session override"
 // @Router   /hlsv2/{id}/{file} [get]
 func (s *server) handleHLS(w http.ResponseWriter, r *http.Request, seg []string) {
 	if r.Method == http.MethodDelete {
@@ -1381,9 +1396,21 @@ func (s *server) handleHLS(w http.ResponseWriter, r *http.Request, seg []string)
 	}
 	id, file := seg[1], seg[2]
 	if file == "master.m3u8" {
-		master, err := s.prober.StartHLS(id, r.URL.Query().Get("mediaURL"))
+		q := r.URL.Query()
+		master, err := s.prober.StartHLS(id, q.Get("mediaURL"), types.HLSSessionOptions{
+			TTL:       q.Get("ttl"),
+			MaxWidth:  q.Get("maxWidth"),
+			MaxHeight: q.Get("maxHeight"),
+			Bitrate:   q.Get("bitrate"),
+			MaxRate:   q.Get("maxRate"),
+			BufSize:   q.Get("bufSize"),
+		})
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			code := http.StatusInternalServerError
+			if errors.Is(err, types.ErrInvalidHLSOption) {
+				code = http.StatusBadRequest
+			}
+			http.Error(w, err.Error(), code)
 			return
 		}
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")

@@ -116,7 +116,7 @@ func TestHLSErrorTextUnchanged(t *testing.T) {
 	if err == nil || err.Error() != "hls: unknown session nope" {
 		t.Errorf("HLSFile unknown-session error = %v, want %q", err, "hls: unknown session nope")
 	}
-	_, err = m.StartHLS("..", "http://93.184.216.34/dummy.mkv")
+	_, err = m.StartHLS("..", "http://93.184.216.34/dummy.mkv", types.HLSSessionOptions{})
 	if err == nil || err.Error() != `hls: invalid session id ".."` {
 		t.Errorf("StartHLS invalid-id error = %v, want %q", err, `hls: invalid session id ".."`)
 	}
@@ -165,7 +165,7 @@ func TestDeleteHLSDefersRemovalWhileInFlight(t *testing.T) {
 	// ...and the id cannot be re-created on top of the directory that is
 	// about to be removed. (Public IP literal: passes validateRemoteURL with
 	// no DNS lookup, and StartHLS returns before any probing.)
-	if _, err := m.StartHLS("busy", "http://93.184.216.34/dummy.mkv"); err == nil || !strings.Contains(err.Error(), "being deleted") {
+	if _, err := m.StartHLS("busy", "http://93.184.216.34/dummy.mkv", types.HLSSessionOptions{}); err == nil || !strings.Contains(err.Error(), "being deleted") {
 		t.Errorf("StartHLS on a draining id = %v, want a 'being deleted' error", err)
 	}
 

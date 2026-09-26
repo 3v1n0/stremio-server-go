@@ -294,7 +294,7 @@ func TestEffectiveSessionConfigDefaultsWhenSettingsUntouched(t *testing.T) {
 		"transcodeHardwareAccel": true,
 		"transcodeProfile":       nil,
 	}}
-	sc := m.effectiveSessionConfig()
+	sc := m.effectiveSessionConfig(sessionOverrides{})
 	if sc.videoBitrate != "8M" || sc.videoMaxrate != "8M" || sc.videoBufsize != "16M" {
 		t.Errorf("untouched transcodeMaxBitRate changed bitrate config: %+v", sc)
 	}
@@ -327,7 +327,7 @@ func TestEffectiveSessionConfigAppliesExplicitOverrides(t *testing.T) {
 		"transcodeHardwareAccel": false,
 		"transcodeProfile":       "slow",
 	}}
-	sc := m.effectiveSessionConfig()
+	sc := m.effectiveSessionConfig(sessionOverrides{})
 	if sc.maxrateBps != 3_000_000 {
 		t.Errorf("maxrateBps = %d, want 3000000", sc.maxrateBps)
 	}
@@ -353,7 +353,7 @@ func TestEffectiveSessionConfigAppliesExplicitOverrides(t *testing.T) {
 
 func TestEffectiveSessionConfigNilSettings(t *testing.T) {
 	m := &hlsManager{cfg: DefaultHLSConfig(), settings: nil}
-	sc := m.effectiveSessionConfig()
+	sc := m.effectiveSessionConfig(sessionOverrides{})
 	if sc.maxrateBps != legacyMaxrateBps || sc.maxWidth != 0 || !sc.hwEnabled {
 		t.Errorf("nil settings must behave exactly like env-only defaults, got %+v", sc)
 	}
@@ -361,7 +361,7 @@ func TestEffectiveSessionConfigNilSettings(t *testing.T) {
 
 func TestEffectiveSessionConfigUnknownProfileIgnored(t *testing.T) {
 	m := &hlsManager{cfg: DefaultHLSConfig(), settings: stubSettings{"transcodeProfile": "turbo-mode"}}
-	sc := m.effectiveSessionConfig()
+	sc := m.effectiveSessionConfig(sessionOverrides{})
 	if sc.x264Preset != "veryfast" || sc.nvencPreset != "p4" || sc.qsvPreset != "veryfast" {
 		t.Errorf("unrecognized transcodeProfile must be ignored, got x264=%q nvenc=%q qsv=%q", sc.x264Preset, sc.nvencPreset, sc.qsvPreset)
 	}
@@ -600,7 +600,7 @@ func TestEffectiveSessionConfigQSVPresetPrecedence(t *testing.T) {
 				cfg.QSVPreset = c.env
 			}
 			m := &hlsManager{cfg: cfg.normalize(1), settings: stubSettings{"transcodeProfile": c.profile}}
-			if got := m.effectiveSessionConfig().qsvPreset; got != c.want {
+			if got := m.effectiveSessionConfig(sessionOverrides{}).qsvPreset; got != c.want {
 				t.Errorf("qsvPreset = %q, want %q", got, c.want)
 			}
 		})

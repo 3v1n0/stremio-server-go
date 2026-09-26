@@ -639,11 +639,12 @@ func hlsConfig(lookup Lookup) media.HLSConfig {
 
 		DisableIdleEviction: sessionTTL == 0,
 
-		VideoBitrate: envBitrate(lookup, "STREMIO_TRANSCODE_VIDEO_BITRATE", d.VideoBitrate),
-		VideoMaxrate: envBitrate(lookup, "STREMIO_TRANSCODE_MAXRATE", d.VideoMaxrate),
-		VideoBufsize: envBitrate(lookup, "STREMIO_TRANSCODE_BUFSIZE", d.VideoBufsize),
-		MaxWidth:     maxWidth,
-		MaxHeight:    maxHeight,
+		SessionOverrides: envBool(lookup, "STREMIO_HLS_SESSION_OVERRIDES", d.SessionOverrides),
+		VideoBitrate:     envBitrate(lookup, "STREMIO_TRANSCODE_VIDEO_BITRATE", d.VideoBitrate),
+		VideoMaxrate:     envBitrate(lookup, "STREMIO_TRANSCODE_MAXRATE", d.VideoMaxrate),
+		VideoBufsize:     envBitrate(lookup, "STREMIO_TRANSCODE_BUFSIZE", d.VideoBufsize),
+		MaxWidth:         maxWidth,
+		MaxHeight:        maxHeight,
 
 		VAAPIQP:     envInt(lookup, "STREMIO_TRANSCODE_VAAPI_QP", d.VAAPIQP),
 		NVENCPreset: getenv(lookup, "STREMIO_TRANSCODE_NVENC_PRESET", d.NVENCPreset),

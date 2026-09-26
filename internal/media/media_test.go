@@ -22,6 +22,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/M0Rf30/stremio-server-go/internal/types"
 )
 
 // ── test helper ───────────────────────────────────────────────────────────────
@@ -257,7 +259,7 @@ func TestHLSManagerIdGuard(t *testing.T) {
 
 	for _, id := range badIDs {
 		t.Run(fmt.Sprintf("id=%q", id), func(t *testing.T) {
-			_, err := m.StartHLS(id, validMediaURL)
+			_, err := m.StartHLS(id, validMediaURL, types.HLSSessionOptions{})
 			if err == nil {
 				t.Errorf("StartHLS(%q) should have returned an error", id)
 			}
@@ -282,7 +284,7 @@ func TestHLSManagerRejectsPrivateMediaURL(t *testing.T) {
 
 	m := newTestHLSManager(t)
 
-	_, err := m.StartHLS("sess-abc", ts.URL+"/dummy.mkv")
+	_, err := m.StartHLS("sess-abc", ts.URL+"/dummy.mkv", types.HLSSessionOptions{})
 	if err == nil {
 		t.Fatal("StartHLS with a loopback mediaURL should have been rejected")
 	}
@@ -309,7 +311,7 @@ func TestHLSManagerAcceptsSelfMediaURL(t *testing.T) {
 
 	// probeMedia will fail on this non-media body, but the failure must come
 	// from probing, not from the SSRF pre-flight rejecting the URL.
-	_, err := m.StartHLS("sess-self", ts.URL+"/ih/0")
+	_, err := m.StartHLS("sess-self", ts.URL+"/ih/0", types.HLSSessionOptions{})
 	if err != nil && strings.Contains(err.Error(), "only http/https allowed") {
 		t.Fatalf("self-origin mediaURL rejected by the SSRF gate: %v", err)
 	}

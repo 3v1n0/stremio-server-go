@@ -160,6 +160,7 @@ func TestHLSConfigEveryKnobOverridable(t *testing.T) {
 		"STREMIO_HLS_POS_PROBE_TTL":        "3m",
 		"STREMIO_HLS_MAX_SESSIONS":         "10",
 		"STREMIO_HLS_WORK_DIR":             "/data/hls",
+		"STREMIO_HLS_SESSION_OVERRIDES":    "1",
 		"STREMIO_TRANSCODE_VIDEO_BITRATE":  "4M",
 		"STREMIO_TRANSCODE_MAXRATE":        "5M",
 		"STREMIO_TRANSCODE_BUFSIZE":        "10M",
@@ -187,6 +188,7 @@ func TestHLSConfigEveryKnobOverridable(t *testing.T) {
 		PosProbeTTL:        3 * time.Minute,
 		MaxSessions:        10,
 		WorkDir:            "/data/hls",
+		SessionOverrides:   true,
 		VideoBitrate:       "4M",
 		VideoMaxrate:       "5M",
 		VideoBufsize:       "10M",
@@ -252,6 +254,18 @@ func TestEnvTonemap(t *testing.T) {
 	}
 }
 
+func TestHLSConfigSessionOverridesGate(t *testing.T) {
+	cases := map[string]bool{"": false, "0": false, "off": false, "false": false, "1": true, "true": true, "on": true}
+	for v, want := range cases {
+		env := map[string]string{}
+		if v != "" {
+			env["STREMIO_HLS_SESSION_OVERRIDES"] = v
+		}
+		if got := hlsConfig(MapLookup(env)).SessionOverrides; got != want {
+			t.Errorf("STREMIO_HLS_SESSION_OVERRIDES=%q → SessionOverrides=%v, want %v", v, got, want)
+		}
+	}
+}
 func TestHLSConfigNegativeMaxWidthHeightRejected(t *testing.T) {
 	got := hlsConfig(MapLookup(map[string]string{
 		"STREMIO_TRANSCODE_MAX_WIDTH":  "-1",

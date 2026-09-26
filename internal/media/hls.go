@@ -118,6 +118,22 @@ type hlsSession struct {
 	// session so every segment is encoded consistently even if /settings
 	// changes again mid-playback; a new session picks up the new values.
 	tc sessionConfig
+	// ttl is this session's own idle-eviction TTL in nanoseconds, from the
+	// ?ttl= per-session override (STREMIO_HLS_SESSION_OVERRIDES). 0 means
+	// "use HLSConfig.SessionTTL". Unlike tc it is not frozen at creation: a
+	// later master.m3u8 request carrying ?ttl= replaces it (see StartHLS), so
+	// a caller can extend or shorten a session's lifetime without affecting
+	// how its segments are encoded.
+	ttl atomic.Int64
+}
+
+// idleTTL returns the idle-eviction window that applies to s: its own
+// per-session TTL when one was set, else the process-wide default.
+func (s *hlsSession) idleTTL(global time.Duration) time.Duration {
+	if v := s.ttl.Load(); v > 0 {
+		return time.Duration(v)
+	}
+	return global
 }
 
 // hwEncoder holds the selected H.264 encoder identity plus any device path
@@ -589,7 +605,21 @@ func doviFromSideData(c *videoColor, list []json.RawMessage) {
 //
 // The master playlist's BANDWIDTH/CODECS are derived from the effective
 // bitrate cap and output resolution (issue #20) — see deriveBandwidthCodecs.
-func (m *hlsManager) StartHLS(id, mediaURL string) (string, error) {
+//
+// opts carries the per-session query overrides. They are ignored entirely
+// unless HLSConfig.SessionOverrides (STREMIO_HLS_SESSION_OVERRIDES) is on;
+// when on, they are validated on every request (an invalid value is an error
+// wrapping types.ErrInvalidHLSOption) and then:
+//   - on the request that creates the session, all of them apply: quality
+//     overrides are folded into the session's snapshotted tc (see
+//     effectiveSessionConfig) and ttl into s.ttl;
+//   - on later requests for an existing session only ttl applies (replacing
+//     the session's TTL); quality overrides are ignored, because tc is
+//     frozen at creation so every segment of a session is encoded alike.
+//
+// Overrides never bypass the mediaURL SSRF check or the session-id guard
+// below, which both run first regardless of opts.
+func (m *hlsManager) StartHLS(id, mediaURL string, opts types.HLSSessionOptions) (string, error) {
 	if mediaURL == "" {
 		return "", fmt.Errorf("hls: missing mediaURL")
 	}
@@ -604,6 +634,13 @@ func (m *hlsManager) StartHLS(id, mediaURL string) (string, error) {
 	// Reject ids that could escape the base directory via path traversal.
 	if !validSessionID(id) {
 		return "", fmt.Errorf("hls: %w %q", types.ErrHLSInvalidSessionID, id)
+	}
+	var ov sessionOverrides
+	if m.cfg.SessionOverrides {
+		var err error
+		if ov, err = parseSessionOverrides(opts); err != nil {
+			return "", fmt.Errorf("hls: %w", err)
+		}
 	}
 	m.mu.Lock()
 	s, ok := m.sessions[id]
@@ -624,11 +661,20 @@ func (m *hlsManager) StartHLS(id, mediaURL string) (string, error) {
 			// Snapshot the effective transcode config now, at session
 			// creation, so a POST /settings change afterward only affects
 			// the *next* new session — see hlsSession.tc's doc comment.
-			tc: m.effectiveSessionConfig(),
+			tc: m.effectiveSessionConfig(ov),
 		}
+		s.ttl.Store(int64(ov.ttl))
 		s.lastAccess.Store(time.Now().UnixNano())
 		_ = os.MkdirAll(s.dir, 0o755)
 		m.sessions[id] = s
+		if ov != (sessionOverrides{}) {
+			logging.For("media").Debug("hls session overrides applied", "id", id,
+				"ttl", ov.ttl, "max_width", s.tc.maxWidth, "max_height", s.tc.maxHeight,
+				"bitrate", s.tc.videoBitrate, "maxrate", s.tc.videoMaxrate, "bufsize", s.tc.videoBufsize)
+		}
+	} else if ov.ttl > 0 {
+		// Existing session: only the TTL may change (see StartHLS doc).
+		s.ttl.Store(int64(ov.ttl))
 	}
 	m.mu.Unlock()
 
@@ -1701,11 +1747,20 @@ func (m *hlsManager) reaper() {
 	}
 }
 
-// evictIdle removes sessions whose lastAccess timestamp is older than
-// HLSConfig.SessionTTL AND that have no work currently in flight. Eviction
-// predicate:
+// evictIdle removes sessions whose lastAccess timestamp is older than their
+// idle TTL AND that have no work currently in flight. The idle TTL is the
+// session's own ?ttl= override when set (hlsSession.ttl), else
+// HLSConfig.SessionTTL. Eviction predicate:
 //
-//	inFlight == 0  &&  lastAccess != 0  &&  lastAccess < now-SessionTTL
+//	inFlight == 0  &&  lastAccess != 0  &&  lastAccess < now-ttl
+//
+// Eviction only happens on reaper ticks, so a session is removed somewhere
+// between ttl and ttl+ReaperInterval after its last access. The reaper
+// interval is derived from the global TTL only (min(30s, SessionTTL/2)), so
+// a per-session TTL shorter than the global one (possible only when the
+// global TTL is above the 60s override floor) is honoured with up to one
+// reaper interval (<= 30s unless STREMIO_HLS_REAPER_INTERVAL raises it) of
+// extra slack; a longer one simply survives more ticks.
 //
 // A session with inFlight > 0 (an HLSFile call — segment transcode, subtitle
 // extraction, or playlist write — is still running) is never evicted no
@@ -1714,12 +1769,17 @@ func (m *hlsManager) reaper() {
 // the in-flight request and orphaning the session id ("unknown session") for
 // every subsequent request. Deleting from a map during range is safe and
 // defined in Go.
+//
+// HLSConfig.DisableIdleEviction (STREMIO_HLS_SESSION_TTL=0) turns off idle
+// eviction for sessions relying on the global TTL, but a session carrying
+// its own per-session ?ttl= override is still evicted on schedule: an
+// explicit per-session ttl wins over the global disable flag, consistent
+// with the documented override > /settings > env precedence in
+// effectiveSessionConfig. The reaper keeps running in this mode (its 30s-ish
+// tick doesn't depend on DisableIdleEviction), so a per-session ttl is
+// always honoured even when the process-wide TTL is 0.
 func (m *hlsManager) evictIdle() {
-	if m.cfg.DisableIdleEviction {
-		// STREMIO_HLS_SESSION_TTL=0: sessions live until DeleteHLS/CloseHLS.
-		return
-	}
-	cutoff := time.Now().Add(-m.cfg.SessionTTL)
+	now := time.Now()
 	var victims []string
 	m.mu.Lock()
 	for id, s := range m.sessions {
@@ -1736,7 +1796,16 @@ func (m *hlsManager) evictIdle() {
 			// map insertion and the first lastAccess.Store); skip to be safe.
 			continue
 		}
-		if time.Unix(0, ts).Before(cutoff) {
+		perSessionTTL := s.ttl.Load() > 0
+		if m.cfg.DisableIdleEviction && !perSessionTTL {
+			// STREMIO_HLS_SESSION_TTL=0: idle eviction is off for sessions
+			// that rely on the global TTL. A session carrying its own
+			// ?ttl= override still wins (per-session override > env,
+			// matching effectiveSessionConfig's precedence) and is still
+			// evicted below.
+			continue
+		}
+		if time.Unix(0, ts).Before(now.Add(-s.idleTTL(m.cfg.SessionTTL))) {
 			delete(m.sessions, id)
 			victims = append(victims, s.dir)
 		}
@@ -1776,7 +1845,9 @@ func ftoa(f float64) string { return strconv.FormatFloat(f, 'f', 3, 64) }
 
 // --- types.MediaProber HLS methods (delegate to the manager) ---
 
-func (p *prober) StartHLS(id, mediaURL string) (string, error) { return p.hls.StartHLS(id, mediaURL) }
+func (p *prober) StartHLS(id, mediaURL string, opts types.HLSSessionOptions) (string, error) {
+	return p.hls.StartHLS(id, mediaURL, opts)
+}
 func (p *prober) HLSFile(ctx context.Context, id, name string) (string, string, error) {
 	return p.hls.HLSFile(ctx, id, name)
 }

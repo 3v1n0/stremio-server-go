@@ -102,6 +102,7 @@ Then point any Stremio client's **streaming server URL** at
 | `STREMIO_HLS_REAPER_INTERVAL` | _(derived)_ | seconds (or a duration string) between HLS idle-session sweeps. Defaults to `min(30s, STREMIO_HLS_SESSION_TTL/2)` so a shorter TTL is still reaped promptly; set explicitly to override the derived value. |
 | `STREMIO_HLS_NEG_PROBE_TTL` | `300` (`5m`) | seconds (or a duration string) a failed/zero-duration `ffprobe` result is cached, to avoid hammering a broken URL (e.g. a torrent with no peers yet) with repeated probes. |
 | `STREMIO_HLS_POS_PROBE_TTL` | `600` (`10m`) | seconds (or a duration string) a successful `ffprobe` result is cached, so duplicate HLS sessions for the same URL skip re-probing. |
+| `STREMIO_HLS_SESSION_OVERRIDES` | _(off)_ | `1`/`true` lets the request that creates an HLS session override its idle TTL and output quality via query parameters on `GET /hlsv2/{id}/master.m3u8` (see [Per-session HLS overrides](#per-session-hls-overrides)). Off by default: the parameters are then ignored entirely. **With the gate on, clients can raise as well as lower the env and `/settings` limits; enable it only when every client that can reach the server is trusted.** |
 | `STREMIO_HLS_MAX_SESSIONS` | `64` | hard cap on simultaneously registered HLS transcode sessions. |
 | `STREMIO_HLS_WORK_DIR` | _(OS temp dir)_ | root directory for HLS segment working directories (`stremio-hls-*` created under it). Unset uses the OS default temp dir, matching prior behaviour. Set to move segment I/O onto a specific fast or large disk. |
 | `STREMIO_HLS_VAAPI_DEVICE` | `/dev/dri/renderD128` | VAAPI render-node device path used for hardware transcoding. Override on multi-GPU hosts (e.g. `/dev/dri/renderD129`). |
@@ -162,6 +163,55 @@ are derived from the effective bitrate cap and output resolution — the
 Level 5.1). An unconfigured server (no bitrate/resolution knob touched) keeps
 advertising the historical fixed `BANDWIDTH=4000000`/`avc1.640029` regardless
 of actual source resolution, so upgrading never changes existing playback.
+A per-session quality override (below) always counts as "configured" and
+takes the derived path, even when its values equal the defaults.
+
+### Per-session HLS overrides
+
+With `STREMIO_HLS_SESSION_OVERRIDES=1`, a front end serving several
+independent sessions can give each its own quality and lifetime, e.g. one
+watch-party room at 5 Mbps for a friend on a slow link and another at
+12 Mbps, or a title prepared hours ahead of a scheduled party with a longer
+idle TTL than casual sessions. The request that creates a session may add:
+
+| Parameter | Meaning | Accepted values |
+|---|---|---|
+| `ttl` | idle-eviction TTL for this session | whole seconds or a Go duration (`3600`, `90m`), from `60s` (the stock default, so an override never makes a session less durable) to `30 days` |
+| `maxWidth`, `maxHeight` | downscale caps, same rules as `STREMIO_TRANSCODE_MAX_WIDTH`/`_HEIGHT` (aspect-preserving, never upscales) | `16`–`7680`, rounded down to even |
+| `bitrate` | video target (`-b:v`); unless given explicitly, `maxRate` = `bitrate` and `bufSize` = 2× `bitrate` | ffmpeg syntax, decimals allowed as for the `STREMIO_TRANSCODE_*` env knobs (`6M`, `1.5M`, `800k`), `100k`–`200M` |
+| `maxRate`, `bufSize` | explicit `-maxrate` / `-bufsize`; when `bitrate` and `maxRate` are both given, `maxRate` must be at least `bitrate` | as `bitrate`; `bufSize` up to `400M` |
+
+```text
+GET /hlsv2/room-a/master.m3u8?mediaURL=…&bitrate=5M&maxHeight=720&ttl=4h
+```
+
+- **Precedence:** per-session override > `/settings` (`transcodeMaxBitRate`,
+  `transcodeMaxWidth`) > env. Knobs not overridden keep their `/settings`/env
+  value; the master playlist `BANDWIDTH`/`CODECS` follow the effective values.
+  A per-session `ttl` beats `STREMIO_HLS_SESSION_TTL=0`
+  (`DisableIdleEviction`) too: a session created with an explicit `ttl` is
+  still evicted by the reaper on schedule even while global idle eviction is
+  off; only a session with no `ttl` of its own is kept forever in that mode.
+- **Validation:** an invalid or out-of-range value fails the request with
+  `400` and a message naming the parameter; no session is created. Parameter
+  names are case-sensitive camelCase as above: unknown or mis-cased names
+  (e.g. `maxrate`) are ignored, and a repeated parameter uses its first
+  value. The `mediaURL` SSRF check and session-id guard run first and are
+  unaffected.
+- **Trust:** overrides are not clamped to the operator's limits. With the
+  gate on, clients can raise as well as lower the env and `/settings` limits
+  (e.g. `maxWidth=7680&bitrate=200M`), and a long `ttl` can hold
+  `STREMIO_HLS_MAX_SESSIONS` slots and disk for days. Enable it only when
+  every client that can reach the server is trusted.
+- **Existing sessions:** a session's transcode settings are frozen when it is
+  created, so quality parameters on later `master.m3u8` requests for the same
+  id are ignored. `ttl` is the exception: it replaces the session's TTL, so a
+  caller can extend (or shorten, never below `60s`) a session's lifetime.
+- **TTL granularity:** idle sessions are reaped on each
+  `STREMIO_HLS_REAPER_INTERVAL` tick, so a session is removed between `ttl`
+  and `ttl` + one reaper interval (≤30s by default) after its last access. A
+  long-TTL session keeps its slot in `STREMIO_HLS_MAX_SESSIONS` (and its
+  segment cache on disk) until then.
 
 `DELETE /hlsv2/{id}` ends an HLS transcode session explicitly, for front ends
 that manage their own session lifecycle rather than relying on the idle

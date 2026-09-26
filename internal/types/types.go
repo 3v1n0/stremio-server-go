@@ -281,6 +281,26 @@ type SettingsStore interface {
 	Save() error
 }
 
+// HLSSessionOptions carries the optional per-session overrides a client may
+// pass as query parameters on GET /hlsv2/{id}/master.m3u8 (ttl, maxWidth,
+// maxHeight, bitrate, maxRate, bufSize). Fields hold the raw, unvalidated
+// query values; "" means "not given". The MediaProber owns parsing, bounds
+// checking and the STREMIO_HLS_SESSION_OVERRIDES opt-in gate — with the gate
+// off every field is ignored, so callers can always pass the query through.
+type HLSSessionOptions struct {
+	TTL       string // idle-eviction TTL: whole seconds or a Go duration string
+	MaxWidth  string // downscale cap, pixels
+	MaxHeight string // downscale cap, pixels
+	Bitrate   string // -b:v, ffmpeg bitrate syntax (e.g. "6M")
+	MaxRate   string // -maxrate; defaults to Bitrate when only Bitrate is given
+	BufSize   string // -bufsize; defaults to 2x Bitrate when only Bitrate is given
+}
+
+// ErrInvalidHLSOption is wrapped by MediaProber.StartHLS when a per-session
+// override in HLSSessionOptions is malformed or out of range. The API layer
+// maps it to 400 Bad Request (every other StartHLS error stays a 500).
+var ErrInvalidHLSOption = errors.New("invalid HLS session option")
+
 // MediaProber backs the ffmpeg-based helper routes. Implementations shell out
 // to ffprobe/ffmpeg. Methods return values that are JSON-encoded verbatim.
 type MediaProber interface {
@@ -292,8 +312,10 @@ type MediaProber interface {
 	// or WEBVTT (ext=="vtt"), applying offsetMs, writing to w.
 	WriteSubtitles(w io.Writer, from, ext string, offsetMs int) error
 	// StartHLS starts (or reuses) an ffmpeg HLS transcode for session id and
-	// returns the master playlist text.
-	StartHLS(id, mediaURL string) (string, error)
+	// returns the master playlist text. opts carries the optional per-session
+	// overrides from the master.m3u8 query string (zero value = none); an
+	// invalid override is reported as an error wrapping ErrInvalidHLSOption.
+	StartHLS(id, mediaURL string, opts HLSSessionOptions) (string, error)
 	// HLSFile returns the filesystem path and content-type for a file in the
 	// HLS session (playlist or .ts segment).
 	HLSFile(ctx context.Context, id, name string) (path, contentType string, err error)
