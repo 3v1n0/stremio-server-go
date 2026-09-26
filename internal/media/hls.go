@@ -3,6 +3,7 @@ package media
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -81,6 +82,9 @@ type hlsSession struct {
 	highBitDepth    bool                   // true if any video stream is 10/12-bit
 	srcWidth        int                    // probed video width; 0 if unknown/no video stream
 	srcHeight       int                    // probed video height; 0 if unknown/no video stream
+	hasVideo        bool                   // first video stream is real video (not absent / cover art)
+	videoEnd        float64                // where that video stream ends, seconds; 0 if unknown
+	isTS            bool                   // source container is MPEG-TS
 	segLocks        map[string]*sync.Mutex // keyed by segment filename
 	lastAccess      atomic.Int64           // unix nanoseconds; updated on each StartHLS/HLSFile call
 	// inFlight counts calls currently executing HLSFile (which covers
@@ -90,6 +94,11 @@ type hlsSession struct {
 	// seg<n>.ts.tmp.ts into it. Incremented/decremented with defer so it
 	// cannot leak on any error path.
 	inFlight atomic.Int32
+	// provisional lists, per segment filename, copies of suspicious
+	// segments that were served but not cached (see installSegment), so the
+	// next transcode of that segment can remove them. Guarded by mu; nil
+	// until first use.
+	provisional map[string][]string
 	// playlistData records which segPrefix playlists have already been rendered
 	// and written to disk; content is immutable once duration is set, so a
 	// presence marker is enough to skip the rebuild + write.  Guarded by mu.
@@ -367,6 +376,13 @@ type probeMediaResult struct {
 	highBitDepth    bool // true if any video stream is 10/12-bit
 	width           int  // first video stream's width; 0 if unknown/no video stream
 	height          int  // first video stream's height; 0 if unknown/no video stream
+	// hasVideo is true when the first video stream (the one -map 0:v:0
+	// selects) is real video rather than attached cover art; videoEnd is
+	// that stream's duration (0 if unknown); isTS is true for MPEG-TS input.
+	// All three feed segment validation (see segExpectation).
+	hasVideo bool
+	videoEnd float64
+	isTS     bool
 }
 
 // probeMedia runs a single ffprobe with -show_format -show_streams and returns
@@ -394,7 +410,8 @@ func probeMedia(ctx context.Context, mediaURL, selfBase string, timeout time.Dur
 	}
 	var r struct {
 		Format struct {
-			Duration string `json:"duration"`
+			Duration   string `json:"duration"`
+			FormatName string `json:"format_name"`
 		} `json:"format"`
 		Streams []struct {
 			Index     int    `json:"index"`
@@ -405,12 +422,15 @@ func probeMedia(ctx context.Context, mediaURL, selfBase string, timeout time.Dur
 			Channels  int    `json:"channels"`
 			Width     int    `json:"width"`
 			Height    int    `json:"height"`
+			Duration  string `json:"duration"`
 			Tags      struct {
 				Language string `json:"language"`
 				Title    string `json:"title"`
+				Duration string `json:"DURATION"` // Matroska per-stream duration
 			} `json:"tags"`
 			Disposition struct {
-				Default int `json:"default"`
+				Default     int `json:"default"`
+				AttachedPic int `json:"attached_pic"` // cover art, not a real video track
 			} `json:"disposition"`
 		} `json:"streams"`
 	}
@@ -423,6 +443,8 @@ func probeMedia(ctx context.Context, mediaURL, selfBase string, timeout time.Dur
 	var subCount int // tracks 0-based index among subtitle streams
 	var highBit bool
 	var width, height int
+	var sawVideo, hasVideo bool
+	var videoEnd float64
 	for _, st := range r.Streams {
 		switch st.CodecType {
 		case "audio":
@@ -450,6 +472,13 @@ func probeMedia(ctx context.Context, mediaURL, selfBase string, timeout time.Dur
 			if width == 0 && height == 0 {
 				width, height = st.Width, st.Height
 			}
+			if !sawVideo {
+				sawVideo = true
+				hasVideo = st.Disposition.AttachedPic == 0
+				if hasVideo {
+					videoEnd = parseStreamDuration(st.Duration, st.Tags.Duration)
+				}
+			}
 		case "subtitle":
 			// Only include text-based subtitle codecs that ffmpeg can convert to WebVTT.
 			// Image-based formats (pgssub / dvdsub / xsub / dvb_subtitle /
@@ -470,7 +499,8 @@ func probeMedia(ctx context.Context, mediaURL, selfBase string, timeout time.Dur
 	}
 	return probeMediaResult{
 		duration: d, audioStreams: audio, subtitleStreams: subs, highBitDepth: highBit,
-		width: width, height: height,
+		width: width, height: height, hasVideo: hasVideo, videoEnd: videoEnd,
+		isTS: strings.Contains(r.Format.FormatName, "mpegts"),
 	}
 }
 
@@ -582,6 +612,9 @@ func (m *hlsManager) StartHLS(id, mediaURL string) (string, error) {
 			s.highBitDepth = res.highBitDepth
 			s.srcWidth = res.width
 			s.srcHeight = res.height
+			s.hasVideo = res.hasVideo
+			s.videoEnd = res.videoEnd
+			s.isTS = res.isTS
 		}
 		s.mu.Unlock()
 	}
@@ -1095,6 +1128,12 @@ func (m *hlsManager) currentConcurrency() int {
 //   - Output: -output_ts_offset -muxdelay 0 -t dur -mpegts_copyts 1
 //     (-t as output option terminates apad in audio-only segments)
 //
+// The output is inspected before it is cached (see segcheck.go): a segment
+// with missing or late video, missing audio, or an input read error logged
+// by ffmpeg is still served but not cached, so the next request transcodes
+// it again. MPEG-TS input with missing/late video is first retried once
+// with a longer input-seek pre-roll.
+//
 // High-bit-depth safety: we never add -hwaccel decode flags (SW decode is always
 // used, which is safe across all input formats).  For VAAPI the filter chain
 // "format=nv12,hwupload" handles 10→8 bit downconversion before GPU upload.
@@ -1105,6 +1144,8 @@ func (m *hlsManager) transcodeSegment(ctx context.Context, s *hlsSession, n int,
 	sessionDur := s.duration
 	highBitDepth := s.highBitDepth
 	srcWidth, srcHeight := s.srcWidth, s.srcHeight
+	hasVideo, videoEnd, isTS := s.hasVideo, s.videoEnd, s.isTS
+	hasAudio := len(s.audioStreams) > 0
 	tc := s.tc
 	s.mu.RUnlock()
 	var filename string
@@ -1146,14 +1187,6 @@ func (m *hlsManager) transcodeSegment(ctx context.Context, s *hlsSession, n int,
 	// computeScaledDims: aspect-preserving, even dimensions, never upscales).
 	outW, outH, scaled := computeScaledDims(srcWidth, srcHeight, tc.maxWidth, tc.maxHeight)
 
-	// Hybrid seeking: fast keyframe seek to (start-10s) before -i, then
-	// accurate output seek for the residual after -i.  This is much faster
-	// than pure output seeking for mid-file segments while still landing on the
-	// correct frame.  The 10-second safety margin ensures we always decode from
-	// a keyframe before the target and the output -ss discards the gap.
-	inputSeek := math.Max(0, start-10.0)
-	outputSeek := start - inputSeek
-
 	// SEC-4: route through the loopback relay instead of handing ffmpeg the
 	// real remote URL directly. Computed once and reused by both the
 	// hardware and (on fallback) software encode attempts below.
@@ -1162,10 +1195,33 @@ func (m *hlsManager) transcodeSegment(ctx context.Context, s *hlsSession, n int,
 		return "", fmt.Errorf("hls: transcode %s: %w", filename, rerr)
 	}
 
-	// run builds the full ffmpeg argument list for the given encoder and executes
-	// the transcode.  enc is either m.enc (hardware attempt) or the libx264
-	// fallback.  The function is called at most twice: HW first, SW on error.
-	run := func(enc hwEncoder) error {
+	// One overall deadline for every ffmpeg run of this segment (HW attempt,
+	// SW fallback, and the optional longer-pre-roll retry), equal to the
+	// worst case before validation existed: one SegmentTimeout for a
+	// software-only encode, two when a hardware attempt precedes the libx264
+	// fallback. The retry only gets whatever time is left; if it runs out,
+	// the first attempt's output is served (see transcodeChecked).
+	useHW := m.enc.isHW && tc.hwEnabled && kind != segAudioOnly
+	deadline := m.cfg.SegmentTimeout
+	if useHW {
+		deadline *= 2
+	}
+	dctx, dcancel := context.WithTimeout(ctx, deadline)
+	defer dcancel()
+
+	// run builds the full ffmpeg argument list for the given encoder and
+	// input-seek pre-roll and executes the transcode.  enc is either m.enc
+	// (hardware attempt) or the libx264 fallback.  It returns the first
+	// input-failure marker seen on ffmpeg's stderr (see inputErrMarkers).
+	run := func(enc hwEncoder, preRoll float64, out string) (string, error) {
+		// Hybrid seeking: fast keyframe seek to (start-preRoll) before -i,
+		// then accurate output seek for the residual after -i.  This is much
+		// faster than pure output seeking for mid-file segments while still
+		// landing on the correct frame, provided a keyframe falls inside the
+		// pre-roll window; the output -ss discards the gap.
+		inputSeek := math.Max(0, start-preRoll)
+		outputSeek := start - inputSeek
+
 		a := []string{"-hide_banner", "-loglevel", "error", "-y"}
 
 		// Input robustness: re-generate missing timestamps; cap probe overhead.
@@ -1302,41 +1358,107 @@ func (m *hlsManager) transcodeSegment(ctx context.Context, s *hlsSession, n int,
 			"-muxdelay", "0",
 			"-t", ftoa(dur),
 			"-mpegts_copyts", "1",
-			"-f", "mpegts", tmp,
+			"-f", "mpegts", out,
 		)
 
-		ctx, cancel := context.WithTimeout(ctx, m.cfg.SegmentTimeout)
+		ctx, cancel := context.WithTimeout(dctx, m.cfg.SegmentTimeout)
 		defer cancel()
-		return exec.CommandContext(ctx, "ffmpeg", a...).Run()
+		cmd := exec.CommandContext(ctx, "ffmpeg", a...)
+		var watch stderrWatch
+		cmd.Stderr = &watch
+		err := cmd.Run()
+		return watch.hit, err
 	}
 
-	// Attempt hardware encode; fall back to libx264 on any error.
-	// If the caller's context is already done when the HW attempt fails,
-	// propagate the cancellation directly — do not start a software re-encode
-	// for a segment that is no longer needed.
+	// encode runs one transcode attempt into out: hardware encode first,
+	// falling back to libx264 on any error. If the caller's context is
+	// already done when the HW attempt fails, propagate the cancellation
+	// directly — do not start a software re-encode for a segment that is no
+	// longer needed.
 	sw := hwEncoder{codec: "libx264"}
-	var err error
-	if m.enc.isHW && tc.hwEnabled && kind != segAudioOnly {
-		// VAAPI/NVENC/etc. accelerates h264 video encoding only; audio is always SW.
-		if err = run(m.enc); err != nil {
-			_ = os.Remove(tmp)
+	var hwCanceled bool
+	encode := func(preRoll float64, out string) (string, error) {
+		if useHW {
+			// VAAPI/NVENC/etc. accelerates h264 video encoding only; audio is always SW.
+			hit, err := run(m.enc, preRoll, out)
+			if err == nil {
+				return hit, nil
+			}
+			_ = os.Remove(out)
 			if ctx.Err() != nil {
+				hwCanceled = true
 				return "", ctx.Err()
 			}
-			err = run(sw) // transparent software fallback
+			return run(sw, preRoll, out) // transparent software fallback
 		}
-	} else {
-		err = run(sw)
+		return run(sw, preRoll, out)
 	}
+	// ffmpeg can exit 0 with a segment missing its video or cut short by an
+	// input error, so inspect the output before caching it (see segcheck.go).
+	// The optional retry writes to its own tmp file so the first attempt's
+	// output survives a failed or timed-out retry.
+	want := segExpectation(kind, hasVideo, videoEnd, hasAudio, start, dur)
+	retryTmp := segFile + ".retry.tmp.ts"
+	out, reason, err := transcodeChecked(dctx, filename, start, isTS, [2]string{tmp, retryTmp}, encode,
+		func(path string) (segVerdict, error) { return inspectSegment(path, want) })
 	if err != nil {
 		_ = os.Remove(tmp)
+		_ = os.Remove(retryTmp)
+		if hwCanceled {
+			return "", err
+		}
 		return "", fmt.Errorf("hls: transcode %s: %w", filename, err)
 	}
-	if err := os.Rename(tmp, segFile); err != nil {
-		_ = os.Remove(tmp)
+	return s.installSegment(filename, out, reason)
+}
+
+// provSeq numbers provisional (served-but-uncached) segment files so
+// concurrent or repeated serves of one segment never share a path.
+var provSeq atomic.Uint64
+
+// installSegment moves a freshly transcoded tmp file (src) into place for
+// filename and returns the path to serve. Any provisional copies left by
+// earlier suspicious transcodes of the same segment are removed first (best
+// effort: on Windows a copy still being served cannot be deleted and is
+// retried next time; session removal deletes whatever remains).
+//
+// reason == "" installs the segment as the cached <filename>. Otherwise the
+// segment is suspicious: it is renamed to a unique
+// "<filename>.prov-<n>.tmp.ts" path that is served for this request only —
+// neither the cache fast path in transcodeSegment nor HLSFile's name
+// parsing ever resolves to it — so the next request transcodes again. The
+// ".tmp" in the name keeps it covered by any sweep of stale *.tmp* files.
+// The caller must hold the segment's lockFor(filename) lock.
+func (s *hlsSession) installSegment(filename, src, reason string) (string, error) {
+	segFile := filepath.Join(s.dir, filename)
+	s.mu.Lock()
+	old := s.provisional[filename]
+	delete(s.provisional, filename)
+	s.mu.Unlock()
+	var keep []string
+	for _, p := range old {
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			keep = append(keep, p)
+		}
+	}
+	dst := segFile
+	if reason != "" {
+		dst = fmt.Sprintf("%s.prov-%d.tmp.ts", segFile, provSeq.Add(1))
+		keep = append(keep, dst)
+	}
+	if len(keep) > 0 {
+		s.mu.Lock()
+		if s.provisional == nil {
+			s.provisional = map[string][]string{}
+		}
+		s.provisional[filename] = append(s.provisional[filename], keep...)
+		s.mu.Unlock()
+	}
+	if err := os.Rename(src, dst); err != nil {
+		_ = os.Remove(src)
 		return "", err
 	}
-	return segFile, nil
+	return dst, nil
 }
 
 // ── CloseHLS ──────────────────────────────────────────────────────────────────
