@@ -407,6 +407,13 @@ func (s *server) handleLocalAddon(w http.ResponseWriter, r *http.Request, seg []
 		}
 		s.localAddonStream(w, r, seg[2], strings.TrimSuffix(seg[3], ".json"))
 
+	case "file":
+		if len(seg) < 3 {
+			http.NotFound(w, r)
+			return
+		}
+		s.localAddonFile(w, r, seg[2])
+
 	default:
 		http.NotFound(w, r)
 	}
@@ -516,16 +523,18 @@ func (s *server) localAddonStream(w http.ResponseWriter, r *http.Request, _, id 
 	items := scanLocalFilesCached()
 
 	makeStream := func(m localMeta) {
+		stream := map[string]any{
+			"title": m.Name,
+			"url":   s.localFileStreamURL(m),
+		}
+		if s.cfg.LocalFilesPublicURL == "" {
+			stream["behaviorHints"] = map[string]any{
+				"notWebReady": true,
+			}
+		}
+
 		writeJSON(w, http.StatusOK, map[string]any{
-			"streams": []any{
-				map[string]any{
-					"title": m.Name,
-					"url":   fileURL(m.Path),
-					"behaviorHints": map[string]any{
-						"notWebReady": true, // local file:// is not browser-accessible
-					},
-				},
-			},
+			"streams": []any{stream},
 		})
 	}
 
@@ -553,6 +562,33 @@ func (s *server) localAddonStream(w http.ResponseWriter, r *http.Request, _, id 
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"streams": []any{}})
+}
+
+// localFileStreamURL returns an HTTP URL for remote clients when configured,
+// otherwise preserving the historical file:// URL used for same-host playback.
+func (s *server) localFileStreamURL(m localMeta) string {
+	if s.cfg.LocalFilesPublicURL == "" {
+		return fileURL(m.Path)
+	}
+
+	return s.cfg.LocalFilesPublicURL + "/local-addon/file/" + m.LocalHex
+}
+
+// localAddonFile serves only files already present in the local add-on index.
+// Using the opaque local hash instead of accepting a filesystem path prevents
+// arbitrary path access. http.ServeFile provides HEAD and byte-range support.
+func (s *server) localAddonFile(w http.ResponseWriter, r *http.Request, localHex string) {
+	items := scanLocalFilesCached()
+	for _, m := range items {
+		if m.LocalHex != localHex {
+			continue
+		}
+
+		http.ServeFile(w, r, m.Path)
+		return
+	}
+
+	http.NotFound(w, r)
 }
 
 // fileURL builds a properly percent-encoded file:// URL from an absolute path.

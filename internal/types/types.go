@@ -62,6 +62,10 @@ type Config struct {
 	// false, local files keep filename-parsed titles and local: ids — no
 	// external IMDb call is made.
 	LocalIMDB bool
+	// LocalFilesPublicURL is the externally reachable base URL used for local-file
+	// streams (STREMIO_LOCAL_FILES_PUBLIC_URL). When empty, the local add-on keeps
+	// returning file:// URLs for backwards-compatible same-host playback.
+	LocalFilesPublicURL string
 
 	// Censorship resistance / anonymity.
 	// BitTorrent peer encryption policy (STREMIO_BT_ENCRYPTION): "prefer" (default; encrypt if peer supports, else
