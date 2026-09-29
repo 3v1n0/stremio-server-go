@@ -577,7 +577,21 @@ func (s *server) localFileStreamURL(m localMeta) string {
 // localAddonFile serves only files already present in the local add-on index.
 // Using the opaque local hash instead of accepting a filesystem path prevents
 // arbitrary path access. http.ServeFile provides HEAD and byte-range support.
+//
+// The endpoint is opt-in: it only exists when STREMIO_LOCAL_FILES_PUBLIC_URL
+// is set. Without it the add-on emits same-host file:// URLs and nothing needs
+// HTTP access, so indexed files are not downloadable by other hosts that can
+// reach the (by default all-interfaces) listener.
 func (s *server) localAddonFile(w http.ResponseWriter, r *http.Request, localHex string) {
+	if s.cfg.LocalFilesPublicURL == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	items := scanLocalFilesCached()
 	for _, m := range items {
 		if m.LocalHex != localHex {

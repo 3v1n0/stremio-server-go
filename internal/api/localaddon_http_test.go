@@ -75,7 +75,7 @@ func TestLocalAddonFileSupportsRangeRequests(t *testing.T) {
 	req.Header.Set("Range", "bytes=2-5")
 	rr := httptest.NewRecorder()
 
-	(&server{}).localAddonFile(rr, req, "abc123")
+	(&server{cfg: types.Config{LocalFilesPublicURL: "http://192.168.1.50:11470"}}).localAddonFile(rr, req, "abc123")
 
 	res := rr.Result()
 	defer res.Body.Close()
@@ -119,9 +119,56 @@ func TestLocalAddonFileRejectsUnknownHash(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/local-addon/file/unknown", nil)
 	rr := httptest.NewRecorder()
 
-	(&server{}).localAddonFile(rr, req, "unknown")
+	(&server{cfg: types.Config{LocalFilesPublicURL: "http://192.168.1.50:11470"}}).localAddonFile(rr, req, "unknown")
 
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want %d", rr.Code, http.StatusNotFound)
+	}
+}
+
+// TestLocalAddonFileGating pins that the file endpoint is opt-in (404 unless
+// STREMIO_LOCAL_FILES_PUBLIC_URL is set) and read-only (GET/HEAD).
+func TestLocalAddonFileGating(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(path, []byte("0123456789"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	oldCache, oldCacheAt := scanCache, scanCacheAt
+	t.Cleanup(func() {
+		scanCacheMu.Lock()
+		scanCache = oldCache
+		scanCacheAt = oldCacheAt
+		scanCacheMu.Unlock()
+	})
+	scanCacheMu.Lock()
+	scanCache = []localMeta{{LocalHex: "h1", Path: path}}
+	scanCacheAt = time.Now()
+	scanCacheMu.Unlock()
+
+	on := types.Config{LocalFilesPublicURL: "http://192.168.1.50:11470"}
+	cases := []struct {
+		name   string
+		cfg    types.Config
+		method string
+		want   int
+	}{
+		{"disabled GET", types.Config{}, http.MethodGet, http.StatusNotFound},
+		{"disabled HEAD", types.Config{}, http.MethodHead, http.StatusNotFound},
+		{"enabled GET", on, http.MethodGet, http.StatusOK},
+		{"enabled HEAD", on, http.MethodHead, http.StatusOK},
+		{"enabled POST", on, http.MethodPost, http.StatusMethodNotAllowed},
+		{"enabled DELETE", on, http.MethodDelete, http.StatusMethodNotAllowed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, "/local-addon/file/h1", nil)
+			rr := httptest.NewRecorder()
+			(&server{cfg: tc.cfg}).localAddonFile(rr, req, "h1")
+			if rr.Code != tc.want {
+				t.Fatalf("status = %d, want %d", rr.Code, tc.want)
+			}
+		})
 	}
 }
