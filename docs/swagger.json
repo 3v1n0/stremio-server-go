@@ -472,6 +472,40 @@
                 }
             }
         },
+        "/hlsv2/{id}": {
+            "delete": {
+                "tags": [
+                    "HLS"
+                ],
+                "summary": "Delete an HLS transcode session",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "session id",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "session deleted"
+                    },
+                    "400": {
+                        "description": "invalid session id",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "404": {
+                        "description": "unknown session",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
         "/hlsv2/{id}/{file}": {
             "get": {
                 "produces": [
@@ -495,11 +529,59 @@
                         "name": "file",
                         "in": "path",
                         "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "media URL to transcode (master.m3u8 only)",
+                        "name": "mediaURL",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "per-session idle TTL, seconds or Go duration, 60s to 30 days (master.m3u8 only; needs STREMIO_HLS_SESSION_OVERRIDES; also updates an existing session)",
+                        "name": "ttl",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "per-session max output width, 16-7680 (master.m3u8 on session creation only; needs STREMIO_HLS_SESSION_OVERRIDES)",
+                        "name": "maxWidth",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "per-session max output height, 16-7680 (master.m3u8 on session creation only; needs STREMIO_HLS_SESSION_OVERRIDES)",
+                        "name": "maxHeight",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "per-session video bitrate, ffmpeg syntax e.g. 6M or 1.5M, 100k-200M (master.m3u8 on session creation only; needs STREMIO_HLS_SESSION_OVERRIDES)",
+                        "name": "bitrate",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "per-session video maxrate, \u003e= bitrate when both given, default = bitrate (master.m3u8 on session creation only; needs STREMIO_HLS_SESSION_OVERRIDES)",
+                        "name": "maxRate",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "per-session video bufsize, default = 2x bitrate (master.m3u8 on session creation only; needs STREMIO_HLS_SESSION_OVERRIDES)",
+                        "name": "bufSize",
+                        "in": "query"
                     }
                 ],
                 "responses": {
                     "200": {
                         "description": "m3u8 / MPEG-TS / WebVTT",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "400": {
+                        "description": "invalid per-session override",
                         "schema": {
                             "type": "string"
                         }

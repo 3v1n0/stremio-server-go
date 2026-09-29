@@ -774,6 +774,28 @@ paths:
       summary: Liveness probe
       tags:
       - System
+  /hlsv2/{id}:
+    delete:
+      parameters:
+      - description: session id
+        in: path
+        name: id
+        required: true
+        type: string
+      responses:
+        "204":
+          description: session deleted
+        "400":
+          description: invalid session id
+          schema:
+            type: string
+        "404":
+          description: unknown session
+          schema:
+            type: string
+      summary: Delete an HLS transcode session
+      tags:
+      - HLS
   /hlsv2/{id}/{file}:
     get:
       parameters:
@@ -787,11 +809,50 @@ paths:
         name: file
         required: true
         type: string
+      - description: media URL to transcode (master.m3u8 only)
+        in: query
+        name: mediaURL
+        type: string
+      - description: per-session idle TTL, seconds or Go duration, 60s to 30 days
+          (master.m3u8 only; needs STREMIO_HLS_SESSION_OVERRIDES; also updates an
+          existing session)
+        in: query
+        name: ttl
+        type: string
+      - description: per-session max output width, 16-7680 (master.m3u8 on session
+          creation only; needs STREMIO_HLS_SESSION_OVERRIDES)
+        in: query
+        name: maxWidth
+        type: integer
+      - description: per-session max output height, 16-7680 (master.m3u8 on session
+          creation only; needs STREMIO_HLS_SESSION_OVERRIDES)
+        in: query
+        name: maxHeight
+        type: integer
+      - description: per-session video bitrate, ffmpeg syntax e.g. 6M or 1.5M, 100k-200M
+          (master.m3u8 on session creation only; needs STREMIO_HLS_SESSION_OVERRIDES)
+        in: query
+        name: bitrate
+        type: string
+      - description: per-session video maxrate, >= bitrate when both given, default
+          = bitrate (master.m3u8 on session creation only; needs STREMIO_HLS_SESSION_OVERRIDES)
+        in: query
+        name: maxRate
+        type: string
+      - description: per-session video bufsize, default = 2x bitrate (master.m3u8
+          on session creation only; needs STREMIO_HLS_SESSION_OVERRIDES)
+        in: query
+        name: bufSize
+        type: string
       produces:
       - application/vnd.apple.mpegurl
       responses:
         "200":
           description: m3u8 / MPEG-TS / WebVTT
+          schema:
+            type: string
+        "400":
+          description: invalid per-session override
           schema:
             type: string
       summary: Serve HLS playlist or segment
