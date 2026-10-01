@@ -68,13 +68,21 @@ jobs:
                       armv7a-linux-androideabi21-clang \
                       armv7a-linux-androideabi21-clang++ \
                       aarch64-linux-android21-clang \
-                      aarch64-linux-android21-clang++; do
+                      aarch64-linux-android21-clang++ \
+                      x86_64-linux-android21-clang \
+                      x86_64-linux-android21-clang++ \
+                      i686-linux-android21-clang \
+                      i686-linux-android21-clang++; do
             test -x "$bin/$tool" || { echo "missing NDK tool: $bin/$tool"; exit 1; }
           done
           echo "ANDROID_ARM_CC=$bin/armv7a-linux-androideabi21-clang" >> "$GITHUB_ENV"
           echo "ANDROID_ARM_CXX=$bin/armv7a-linux-androideabi21-clang++" >> "$GITHUB_ENV"
           echo "ANDROID_ARM64_CC=$bin/aarch64-linux-android21-clang" >> "$GITHUB_ENV"
           echo "ANDROID_ARM64_CXX=$bin/aarch64-linux-android21-clang++" >> "$GITHUB_ENV"
+          echo "ANDROID_AMD64_CC=$bin/x86_64-linux-android21-clang" >> "$GITHUB_ENV"
+          echo "ANDROID_AMD64_CXX=$bin/x86_64-linux-android21-clang++" >> "$GITHUB_ENV"
+          echo "ANDROID_386_CC=$bin/i686-linux-android21-clang" >> "$GITHUB_ENV"
+          echo "ANDROID_386_CXX=$bin/i686-linux-android21-clang++" >> "$GITHUB_ENV"
       - name: Install syft (for goreleaser SBOMs)
         uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3

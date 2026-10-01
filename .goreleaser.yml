@@ -9,6 +9,10 @@ env:
   - ANDROID_ARM_CXX={{ if index .Env "ANDROID_ARM_CXX" }}{{ .Env.ANDROID_ARM_CXX }}{{ else }}armv7a-linux-androideabi21-clang++{{ end }}
   - ANDROID_ARM64_CC={{ if index .Env "ANDROID_ARM64_CC" }}{{ .Env.ANDROID_ARM64_CC }}{{ else }}aarch64-linux-android21-clang{{ end }}
   - ANDROID_ARM64_CXX={{ if index .Env "ANDROID_ARM64_CXX" }}{{ .Env.ANDROID_ARM64_CXX }}{{ else }}aarch64-linux-android21-clang++{{ end }}
+  - ANDROID_AMD64_CC={{ if index .Env "ANDROID_AMD64_CC" }}{{ .Env.ANDROID_AMD64_CC }}{{ else }}x86_64-linux-android21-clang{{ end }}
+  - ANDROID_AMD64_CXX={{ if index .Env "ANDROID_AMD64_CXX" }}{{ .Env.ANDROID_AMD64_CXX }}{{ else }}x86_64-linux-android21-clang++{{ end }}
+  - ANDROID_386_CC={{ if index .Env "ANDROID_386_CC" }}{{ .Env.ANDROID_386_CC }}{{ else }}i686-linux-android21-clang{{ end }}
+  - ANDROID_386_CXX={{ if index .Env "ANDROID_386_CXX" }}{{ .Env.ANDROID_386_CXX }}{{ else }}i686-linux-android21-clang++{{ end }}
 
 before:
   hooks:
@@ -178,6 +182,89 @@ builds:
     goarm:
       - "7"
 
+  # Android x86_64 / x86 (emulators, Chromebooks/ARC, Android-x86 boxes).
+  # Same cgo-for-DNS, external-linking and -static-libstdc++ rationale as the
+  # arm builds above; executables use -pie, the c-shared libs do not.
+  - id: stremio-server-android-amd64
+    main: ./cmd/stremio-server
+    binary: stremio-server
+    env:
+      - CGO_ENABLED=1
+      - CC={{ .Env.ANDROID_AMD64_CC }}
+      - CXX={{ .Env.ANDROID_AMD64_CXX }}
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -checklinkname=0
+      - -linkmode=external
+      - '-extldflags "-pie -lm -static-libstdc++"'
+      - -X main.buildVersion={{ .Version }}
+      - -X main.buildCommit={{ .ShortCommit }}
+      - -X main.buildDate={{ .Date }}
+    goos:
+      - android
+    goarch:
+      - amd64
+
+  - id: stremio-server-android-amd64-lib
+    main: ./cmd/libstremio
+    binary: libstremio-server
+    buildmode: c-shared
+    env:
+      - CGO_ENABLED=1
+      - CC={{ .Env.ANDROID_AMD64_CC }}
+      - CXX={{ .Env.ANDROID_AMD64_CXX }}
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -checklinkname=0
+      - -linkmode=external
+      - '-extldflags "-lm -static-libstdc++"'
+    goos:
+      - android
+    goarch:
+      - amd64
+
+  - id: stremio-server-android-386
+    main: ./cmd/stremio-server
+    binary: stremio-server
+    env:
+      - CGO_ENABLED=1
+      - CC={{ .Env.ANDROID_386_CC }}
+      - CXX={{ .Env.ANDROID_386_CXX }}
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -checklinkname=0
+      - -linkmode=external
+      - '-extldflags "-pie -lm -static-libstdc++"'
+      - -X main.buildVersion={{ .Version }}
+      - -X main.buildCommit={{ .ShortCommit }}
+      - -X main.buildDate={{ .Date }}
+    goos:
+      - android
+    goarch:
+      - "386"
+
+  - id: stremio-server-android-386-lib
+    main: ./cmd/libstremio
+    binary: libstremio-server
+    buildmode: c-shared
+    env:
+      - CGO_ENABLED=1
+      - CC={{ .Env.ANDROID_386_CC }}
+      - CXX={{ .Env.ANDROID_386_CXX }}
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -checklinkname=0
+      - -linkmode=external
+      - '-extldflags "-lm -static-libstdc++"'
+    goos:
+      - android
+    goarch:
+      - "386"
+
 upx:
   # Linux only: macOS Gatekeeper rejects upx-packed Mach-O, and upx on
   # android can break the loader.
@@ -211,6 +298,10 @@ archives:
       - stremio-server-android-arm
       - stremio-server-android-lib
       - stremio-server-android-arm-lib
+      - stremio-server-android-amd64
+      - stremio-server-android-amd64-lib
+      - stremio-server-android-386
+      - stremio-server-android-386-lib
     formats: tar.gz
     name_template: *archive_name
 

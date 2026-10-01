@@ -30,7 +30,7 @@ Not affiliated with or endorsed by Stremio.
 
 ## Install
 
-Prebuilt binaries for **Linux, macOS, Windows, and Android (arm64/armv7)** are
+Prebuilt binaries for **Linux, macOS, Windows, and Android (arm64/armv7/x86_64/x86)** are
 attached to each [release](https://github.com/M0Rf30/stremio-server-go/releases).
 
 From source (Go 1.27.1+; CGO is not required):
@@ -358,7 +358,7 @@ downloading:
 ## Platforms
 
 `linux/{amd64,arm64,arm}`, `darwin/{amd64,arm64}`, `windows/{amd64,arm64}` all
-build `CGO_ENABLED=0` as pure-Go cross-compiles. `android/{arm64,armv7}` are
+build `CGO_ENABLED=0` as pure-Go cross-compiles. `android/{arm64,armv7,amd64,386}` are
 the exception: Android ships no `/etc/resolv.conf`, so a pure-Go binary's
 resolver falls back to `127.0.0.1:53` (nothing listens there) and every DNS
 lookup fails, so both build `CGO_ENABLED=1` against an NDK clang, linking
@@ -371,7 +371,7 @@ as a plain `linux/arm64` binary under Termux.
 Android 10+ denies `exec()` of files an app downloaded into its own data
 directory (SELinux W^X for targetSdk ≥ 29, i.e. Kodi 19+), but still allows
 `dlopen()` of them. `cmd/libstremio` therefore builds the same server with
-`-buildmode=c-shared` for `android/{arm64,armv7}` (`make lib-android`; shipped
+`-buildmode=c-shared` for `android/{arm64,armv7,amd64,386}` (`make lib-android`; shipped
 inside the Android release archives next to the executable). Exports:
 
 ```c

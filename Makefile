@@ -42,6 +42,10 @@ ANDROID_ARM_CC     ?= armv7a-linux-androideabi21-clang
 ANDROID_ARM_CXX    ?= armv7a-linux-androideabi21-clang++
 ANDROID_ARM64_CC   ?= aarch64-linux-android21-clang
 ANDROID_ARM64_CXX  ?= aarch64-linux-android21-clang++
+ANDROID_AMD64_CC   ?= x86_64-linux-android21-clang
+ANDROID_AMD64_CXX  ?= x86_64-linux-android21-clang++
+ANDROID_386_CC     ?= i686-linux-android21-clang
+ANDROID_386_CXX    ?= i686-linux-android21-clang++
 ANDROID_LDFLAGS    := -linkmode=external -extldflags "-pie -lm -static-libstdc++"
 # libstremio-server.so (cmd/libstremio, -buildmode=c-shared) reuses the same
 # NDK CC/CXX and -static-libstdc++ as the executable above, but MUST NOT pass
@@ -122,6 +126,20 @@ build-all: ## Cross-build all release targets into dist/
 	else \
 		echo "skipping android/armv7: $(ANDROID_ARM_CC) not found (set ANDROID_ARM_CC to an NDK clang)"; \
 	fi
+	@if command -v $(ANDROID_AMD64_CC) >/dev/null 2>&1; then \
+		CGO_ENABLED=1 CC=$(ANDROID_AMD64_CC) CXX=$(ANDROID_AMD64_CXX) \
+		GOOS=android GOARCH=amd64 \
+		go build -trimpath -ldflags '$(LDFLAGS) $(ANDROID_LDFLAGS)' -o $(DIST)/$(BINARY)_android_amd64 $(MAIN); \
+	else \
+		echo "skipping android/amd64: $(ANDROID_AMD64_CC) not found (set ANDROID_AMD64_CC to an NDK clang)"; \
+	fi
+	@if command -v $(ANDROID_386_CC) >/dev/null 2>&1; then \
+		CGO_ENABLED=1 CC=$(ANDROID_386_CC) CXX=$(ANDROID_386_CXX) \
+		GOOS=android GOARCH=386 \
+		go build -trimpath -ldflags '$(LDFLAGS) $(ANDROID_LDFLAGS)' -o $(DIST)/$(BINARY)_android_386 $(MAIN); \
+	else \
+		echo "skipping android/386: $(ANDROID_386_CC) not found (set ANDROID_386_CC to an NDK clang)"; \
+	fi
 	@$(MAKE) lib-android
 
 # libstremio-server.so: the same server, in c-shared mode, for SELinux-
@@ -129,7 +147,7 @@ build-all: ## Cross-build all release targets into dist/
 # dropped next to its own native libs but is blocked from exec()'ing a
 # bundled executable. Shipped inside the same Android release archives as
 # the stremio-server_android_{arm64,armv7} executable (see .goreleaser.yml).
-lib-android: ## Cross-build libstremio-server.so (c-shared) for android/{arm64,armv7} into dist/
+lib-android: ## Cross-build libstremio-server.so (c-shared) for android/{arm64,armv7,amd64,386} into dist/
 	@mkdir -p $(DIST)
 	@if command -v $(ANDROID_ARM64_CC) >/dev/null 2>&1; then \
 		CGO_ENABLED=1 CC=$(ANDROID_ARM64_CC) CXX=$(ANDROID_ARM64_CXX) \
@@ -146,6 +164,22 @@ lib-android: ## Cross-build libstremio-server.so (c-shared) for android/{arm64,a
 			-o $(DIST)/$(LIB_BINARY)_android_armv7.so $(LIBMAIN); \
 	else \
 		echo "skipping libstremio-server android/armv7: $(ANDROID_ARM_CC) not found (set ANDROID_ARM_CC to an NDK clang)"; \
+	fi
+	@if command -v $(ANDROID_AMD64_CC) >/dev/null 2>&1; then \
+		CGO_ENABLED=1 CC=$(ANDROID_AMD64_CC) CXX=$(ANDROID_AMD64_CXX) \
+		GOOS=android GOARCH=amd64 \
+		go build -trimpath -buildmode=c-shared -ldflags '-s -w -checklinkname=0 $(ANDROID_LIB_LDFLAGS)' \
+			-o $(DIST)/$(LIB_BINARY)_android_amd64.so $(LIBMAIN); \
+	else \
+		echo "skipping libstremio-server android/amd64: $(ANDROID_AMD64_CC) not found (set ANDROID_AMD64_CC to an NDK clang)"; \
+	fi
+	@if command -v $(ANDROID_386_CC) >/dev/null 2>&1; then \
+		CGO_ENABLED=1 CC=$(ANDROID_386_CC) CXX=$(ANDROID_386_CXX) \
+		GOOS=android GOARCH=386 \
+		go build -trimpath -buildmode=c-shared -ldflags '-s -w -checklinkname=0 $(ANDROID_LIB_LDFLAGS)' \
+			-o $(DIST)/$(LIB_BINARY)_android_386.so $(LIBMAIN); \
+	else \
+		echo "skipping libstremio-server android/386: $(ANDROID_386_CC) not found (set ANDROID_386_CC to an NDK clang)"; \
 	fi
 	@echo "built -> $(DIST)/"
 

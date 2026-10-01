@@ -107,6 +107,8 @@ jobs:
           # without external linking.
           - { goos: android, goarch: arm64, ldextra: "-checklinkname=0", cgo: "1", ndk: true, ndkabi: "aarch64-linux-android" }
           - { goos: android, goarch: arm, goarm: "7", ldextra: "-checklinkname=0", cgo: "1", ndk: true, ndkabi: "armv7a-linux-androideabi" }
+          - { goos: android, goarch: amd64, ldextra: "-checklinkname=0", cgo: "1", ndk: true, ndkabi: "x86_64-linux-android" }
+          - { goos: android, goarch: "386", ldextra: "-checklinkname=0", cgo: "1", ndk: true, ndkabi: "i686-linux-android" }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
