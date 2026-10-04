@@ -139,6 +139,10 @@ type Wire struct {
 // All fields are required (non-null) to match stremio-core's Source shape, which
 // the strict (deny-missing) Statistics deserializer rejects if any are absent.
 // url MUST be a parseable URL (udp:// or http(s)://) — never a "dht:" pseudo-URI.
+// Source is one stats.sources entry. URL carries the "tracker:" (or "dht:")
+// prefix the official server uses — e.g. "tracker:udp://host:1337/announce",
+// not a bare udp/http URL; stremio-core parses it as a Url. NumRequests is a
+// documented constant because anacrolix exposes no per-tracker announce count.
 type Source struct {
 	LastStarted  string `json:"lastStarted"`
 	URL          string `json:"url"`
