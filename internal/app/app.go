@@ -526,9 +526,7 @@ func Run(ctx context.Context, cfg Config, logw io.Writer) error {
 		// ctx is already cancelled here; drain on a detached deadline.
 		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
-		if err := s.Shutdown(sctx); err != nil {
-			logging.For(name).Error("shutdown error", "err", err)
-		}
+		shutdownServer(sctx, s, name)
 	}
 	shutWg.Add(1)
 	go shutOne(srv, "http")
@@ -702,5 +700,18 @@ func hlsConfig(lookup Lookup) media.HLSConfig {
 		ProbeTimeout:    envDuration(lookup, "STREMIO_HLS_PROBE_TIMEOUT", d.ProbeTimeout),
 
 		SeekPreroll: seekPreroll(lookup, d.SeekPreroll),
+	}
+}
+
+// shutdownServer gracefully drains s until ctx expires, then force-closes any
+// lingering connections so a stuck stream cannot outlive the shutdown window.
+func shutdownServer(ctx context.Context, s *http.Server, name string) {
+	err := s.Shutdown(ctx)
+	if err == nil {
+		return
+	}
+	logging.For(name).Error("shutdown error", "err", err)
+	if errors.Is(err, context.DeadlineExceeded) {
+		_ = s.Close()
 	}
 }

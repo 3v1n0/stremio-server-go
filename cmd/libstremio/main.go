@@ -123,9 +123,10 @@ func ServerStart(logPath *C.char, envJSON *C.char) (ret C.int) {
 
 	envMap, err := parseEnvJSON(envJSON)
 	if err != nil {
-		logging.For("libstremio").Error("invalid envJSON", "err", err)
+		_, _ = fmt.Fprintf(logw, "libstremio: invalid envJSON: %v\n", err)
 		return 1
 	}
+	defer applyOSEnv(envMap)()
 
 	cfg := app.Config{Lookup: app.MapLookup(envMap)}
 	if v, ok := envMap["STREMIO_SERVER_VERSION"]; ok && v != "" {
@@ -133,7 +134,7 @@ func ServerStart(logPath *C.char, envJSON *C.char) (ret C.int) {
 	}
 
 	if err := app.Run(runCtx, cfg, logw); err != nil {
-		logging.For("libstremio").Error("server exited with error", "err", err)
+		_, _ = fmt.Fprintf(logw, "libstremio: server exited with error: %v\n", err)
 		return 1
 	}
 	return 0
@@ -190,21 +191,71 @@ func parseEnvJSON(envJSON *C.char) (map[string]string, error) {
 }
 
 // openLog opens logPath for appending (creating it if needed) and returns it
-// plus a close func. A nil/blank logPath, or a path that fails to open,
-// falls back to os.Stderr with a no-op close.
+// plus a close func. A nil/blank logPath falls back to os.Stderr silently; a
+// path that fails to open falls back to os.Stderr and the failure is
+// reported on stderr so it is never silent.
 func openLog(logPath *C.char) (io.Writer, func()) {
 	if logPath == nil {
 		return os.Stderr, func() {}
 	}
-	p := strings.TrimSpace(C.GoString(logPath))
+	return openLogFile(C.GoString(logPath), os.Stderr)
+}
+
+// openLogFile is the cgo-free core of openLog; warn receives the open
+// failure message when the fallback is used.
+func openLogFile(path string, warn io.Writer) (io.Writer, func()) {
+	p := strings.TrimSpace(path)
 	if p == "" {
 		return os.Stderr, func() {}
 	}
 	f, err := os.OpenFile(p, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
+		_, _ = fmt.Fprintf(warn, "libstremio: cannot open log file %q, logging to stderr: %v\n", p, err)
 		return os.Stderr, func() {}
 	}
 	return f, func() { _ = f.Close() }
+}
+
+// osGetenvKeys are the knobs still read via os.Getenv directly in other
+// packages (not threaded through Lookup); envJSON values for them must be
+// mirrored into the process environment for library mode to honour them.
+var osGetenvKeys = []string{
+	"STREMIO_LOG_LEVEL",
+	"STREMIO_LOG_FORMAT",
+	"STREMIO_HWACCEL",
+	"STREMIO_ARCHIVE_ALLOW_PRIVATE",
+	"STREMIO_ARCHIVE_LOCAL_ROOT",
+	"STREMIO_FTP_ALLOW_PRIVATE",
+	"LOCAL_FILES_DIR",
+}
+
+// applyOSEnv exports the os.Getenv-based keys present in m into the process
+// environment and returns a func restoring the previous values.
+func applyOSEnv(m map[string]string) func() {
+	type prev struct {
+		key string
+		val string
+		set bool
+	}
+	var saved []prev
+	for _, k := range osGetenvKeys {
+		v, ok := m[k]
+		if !ok {
+			continue
+		}
+		old, was := os.LookupEnv(k)
+		saved = append(saved, prev{k, old, was})
+		_ = os.Setenv(k, v)
+	}
+	return func() {
+		for _, p := range saved {
+			if p.set {
+				_ = os.Setenv(p.key, p.val)
+			} else {
+				_ = os.Unsetenv(p.key)
+			}
+		}
+	}
 }
 
 // main is required for a c-shared buildmode package but is never executed;
