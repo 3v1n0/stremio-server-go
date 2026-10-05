@@ -391,11 +391,14 @@ func (m *manager) EnsureEngine(infoHash string, opts types.AddOptions) (types.En
 		m.mu.RLock()
 		if e, ok := m.engines[ih]; ok {
 			t := e.t // read e.t under RLock before releasing
-			m.mu.RUnlock()
-			mergeTrackers(t, opts, !m.cfg.DisableWebtorrent)
+			// Touch lastAccess while m.mu is still held: the janitor's
+			// re-check takes m.mu.Lock, so it cannot evict between lookup
+			// and the bump. Lock order m.mu -> e.mu matches the slow path.
 			e.mu.Lock()
 			e.lastAccess = time.Now()
 			e.mu.Unlock()
+			m.mu.RUnlock()
+			mergeTrackers(t, opts, !m.cfg.DisableWebtorrent)
 			return e, nil
 		}
 		waitCh := m.purging[ih]

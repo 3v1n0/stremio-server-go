@@ -42,12 +42,20 @@ func New(cfg types.Config) (types.SettingsStore, error) {
 	if err == nil {
 		// File exists — unmarshal and overlay onto defaults.
 		var loaded map[string]interface{}
-		if jsonErr := json.Unmarshal(data, &loaded); jsonErr == nil {
+		if jsonErr := json.Unmarshal(data, &loaded); jsonErr != nil {
+			// Quarantine the corrupt file so the next Save() does not
+			// silently overwrite it; best effort.
+			bad := path + ".bad"
+			if rnErr := os.Rename(path, bad); rnErr != nil {
+				logging.For("settings").Warn("malformed settings file; using defaults", "path", path, "err", jsonErr, "rename_err", rnErr)
+			} else {
+				logging.For("settings").Warn("malformed settings file moved aside; using defaults", "path", path, "backup", bad, "err", jsonErr)
+			}
+		} else {
 			for k, v := range loaded {
 				s.values[k] = v
 			}
 		}
-		// Malformed JSON is silently ignored; defaults remain intact.
 
 		// cfg-pinned fields always win regardless of what was persisted.
 		s.values["appPath"] = cfg.AppPath

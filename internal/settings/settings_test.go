@@ -23,6 +23,28 @@ func cfg(appPath string) types.Config {
 	}
 }
 
+func TestMalformedFileQuarantined(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "server-settings.json")
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ss, err := settings.New(cfg(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ss.Values()["serverVersion"] != "4.21.0" {
+		t.Errorf("defaults not applied")
+	}
+	got, err := os.ReadFile(path + ".bad")
+	if err != nil || string(got) != "{not json" {
+		t.Fatalf("backup missing/wrong: %v %q", err, got)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("original should have been moved aside: %v", err)
+	}
+}
+
 func TestDefaults(t *testing.T) {
 	dir := t.TempDir()
 	ss, err := settings.New(cfg(dir))
