@@ -69,6 +69,23 @@ type engine struct {
 	infoHash string // lower-cased
 	path     string // cache path (reported in Stats.opts.path)
 
+	// connectionTries is a best-effort count of outbound dial churn: it sums
+	// increases in HalfOpenPeers between successive Stats() samples. anacrolix
+	// exposes no cumulative dial counter, so dials that start and finish between
+	// two polls are missed; it is reported as swarm.tries, which server.js fills
+	// from its own dial counter.
+	connTriesMu     sync.Mutex
+	prevHalfOpen    int
+	connectionTries int
+
+	// optsSource rebuilds the manager-derived, non-per-torrent subset of
+	// stats.opts (connection budget, client timeouts, swarm caps). It is a
+	// function, not a value captured at engine creation, so Stats() re-reads it
+	// on each announce-cache refresh: a runtime soft-limit change is then
+	// reflected (instead of frozen) and the soft-limit callback is never invoked
+	// under the manager lock. Set once at creation.
+	optsSource func() types.Options
+
 	mu               sync.Mutex
 	last             speedSample
 	lastDLSpeed      float64          // cached bytes/sec from last Stats(); used for readahead scaling
@@ -162,6 +179,12 @@ type manager struct {
 	cfg         types.Config
 	downLimiter *rate.Limiter // shared pointer in cc.DownloadRateLimiter; updated by SetLimitFn
 	upLimiter   *rate.Limiter // shared pointer in cc.UploadRateLimiter; updated by SetLimitFn
+
+	// handshakeTimeout / dialTimeout are the anacrolix client-config timeouts
+	// (cc.HandshakesTimeout / cc.NominalDialTimeout) reported in stats.opts
+	// (milliseconds), so opts reflects the real client instead of a constant.
+	handshakeTimeout time.Duration
+	dialTimeout      time.Duration
 
 	// storage is the piece storage backend handed to anacrolix as
 	// DefaultStorage. anacrolix does not Close a user-provided DefaultStorage,
@@ -351,6 +374,8 @@ func New(cfg types.Config) (types.EngineManager, error) {
 		cfg:                        cfg,
 		downLimiter:                downLimiter,
 		upLimiter:                  upLimiter,
+		handshakeTimeout:           cc.HandshakesTimeout,
+		dialTimeout:                cc.NominalDialTimeout,
 		engines:                    make(map[string]*engine),
 		done:                       done,
 		storage:                    storageCloser,
@@ -457,7 +482,13 @@ func (m *manager) EnsureEngine(infoHash string, opts types.AddOptions) (types.En
 		// trackerless magnets still find peers instead of relying on DHT alone.
 		t.AddTrackers([][]string{announceableTrackers(getTrackers(), !m.cfg.DisableWebtorrent)})
 
-		e := &engine{t: t, infoHash: ih, path: filepath.Join(m.cfg.CacheRoot, ih), lastAccess: time.Now()}
+		e := &engine{
+			t:          t,
+			infoHash:   ih,
+			path:       filepath.Join(m.cfg.CacheRoot, ih),
+			lastAccess: time.Now(),
+			optsSource: m.statsOptsSource,
+		}
 		m.engines[ih] = e
 		m.mu.Unlock()
 
@@ -670,6 +701,40 @@ func (m *manager) SetSoftLimitFn(fn func() (softLimitBytesPerSec int64, minPeers
 	m.softLimitFn = fn
 	m.limitMu.Unlock()
 	m.startLimitLoop()
+}
+
+// statsOptsSource returns the effective connection/timeout/swarm-cap values for
+// stats.opts, derived from the manager config, the anacrolix client timeouts,
+// and the configured soft limit. These mirror what the official server reports
+// (connections, timeout, handshakeTimeout, swarmCap.minPeers/maxSpeed) instead
+// of leaving them null. maxSpeed stays null when no soft limit is configured,
+// matching server.js when unset. Per-torrent fields (peerSearch, path, dht,
+// tracker) are filled in by Stats().
+func (m *manager) statsOptsSource() types.Options {
+	est, _, _ := peerBudget(m.cfg.PeersPerTorrent)
+	conns := est
+	// Read the timeouts from the client config (ms, like server.js): the
+	// handshake timeout is anacrolix HandshakesTimeout (4s default), the dial
+	// timeout is NominalDialTimeout (20s default).
+	handshakeMs := int(m.handshakeTimeout / time.Millisecond)
+	dialMs := int(m.dialTimeout / time.Millisecond)
+	opts := types.Options{
+		Connections:      &conns,
+		HandshakeTimeout: &handshakeMs,
+		Timeout:          &dialMs,
+		Virtual:          false,
+	}
+	m.limitMu.Lock()
+	soft := m.softLimitFn
+	m.limitMu.Unlock()
+	if soft != nil {
+		if softBytes, minPeers := soft(); softBytes > 0 {
+			ms := float64(softBytes)
+			mp := minPeers
+			opts.SwarmCap = types.SwarmCap{MaxSpeed: &ms, MinPeers: &mp}
+		}
+	}
+	return opts
 }
 
 // startLimitLoop launches the shared 5 s background goroutine (stopped on
@@ -1562,6 +1627,19 @@ func (e *engine) GuessFileIdx() int {
 	return bestAny
 }
 
+// accumulateConnTries folds this sample's half-open peer count into the running
+// dial-churn heuristic and returns the new total (see the engine field comment).
+func (e *engine) accumulateConnTries(halfOpen int) int {
+	e.connTriesMu.Lock()
+	if halfOpen > e.prevHalfOpen {
+		e.connectionTries += halfOpen - e.prevHalfOpen
+	}
+	e.prevHalfOpen = halfOpen
+	n := e.connectionTries
+	e.connTriesMu.Unlock()
+	return n
+}
+
 // Stats returns a types.Stats snapshot. When idx >= 0 the per-file stream
 // fields (StreamLen, StreamName, StreamProgress) are also populated.
 // Download/upload speeds are computed from byte deltas between successive calls.
@@ -1606,6 +1684,7 @@ func (e *engine) stats(idx int, touch bool) *types.Stats {
 	if dlSpeed > 0 {
 		e.lastDLSpeed = dlSpeed // cache for NewReader readahead scaling
 	}
+	swarmPaused := e.softPaused // read under the lock; server.js's e.swarm.paused
 	e.mu.Unlock()
 
 	// Clamp negative speeds (can happen when the client resets counters).
@@ -1619,6 +1698,15 @@ func (e *engine) stats(idx int, touch bool) *types.Stats {
 	// Peer gauges — embedded via TorrentGauges.
 	activePeers := ts.ActivePeers
 	totalPeers := ts.TotalPeers
+	halfOpen := ts.HalfOpenPeers
+	pending := ts.PendingPeers
+
+	// connectionTries: server.js exposes swarm.tries from its own dial counter.
+	// anacrolix has no cumulative dial count, so this is a heuristic: it sums
+	// increases in HalfOpenPeers between samples, so dials that start and finish
+	// between two polls are missed. It still reflects real dial activity on a
+	// polled torrent better than a constant 0.
+	connTries := e.accumulateConnTries(halfOpen)
 
 	files := e.Files()
 	if files == nil {
@@ -1641,14 +1729,20 @@ func (e *engine) stats(idx int, touch bool) *types.Stats {
 		peerSrcs = append(peerSrcs, "dht:"+e.infoHash)
 		peerSrcs = append(peerSrcs, urls...)
 		e.cachedURLs = urls
-		e.cachedOpts = types.Options{
-			DHT:        true,
-			Growler:    types.Growler{Flood: 0},
-			Path:       e.path,
-			PeerSearch: types.PeerSearch{Min: 40, Max: 200, Sources: peerSrcs},
-			Tracker:    true,
-		}
-		// Build Sources skeleton with stable fields (URL, NumRequests).
+		// Rebuild the manager-derived opts on each refresh (outside the manager
+		// lock) so a runtime soft-limit change is reflected and swarmCap cannot
+		// disagree with the live enforcement, then fill the per-torrent bits.
+		base := e.optsSource()
+		base.PeerSearch = types.PeerSearch{Min: 40, Max: 200, Sources: peerSrcs}
+		base.DHT = true
+		base.Growler = types.Growler{Flood: 0}
+		base.Path = e.path
+		base.Tracker = true
+		e.cachedOpts = base
+		// Build the Sources skeleton. server.js prefixes tracker announce URLs
+		// with "tracker:"; match that so duplicate source URLs are not
+		// ambiguous. anacrolix exposes no per-tracker announce count, so
+		// numRequests is a documented constant rather than a poll-rate guess.
 		// Per-call-varying fields (LastStarted, NumFound, NumFoundUniq) are
 		// stamped onto a shallow copy below, avoiding re-iteration every Stats().
 		skel := make([]types.Source, 0, len(urls))
@@ -1657,7 +1751,7 @@ func (e *engine) stats(idx int, touch bool) *types.Stats {
 				!strings.HasPrefix(u, "https://") {
 				continue // skip wss:// and any non-URL forms
 			}
-			skel = append(skel, types.Source{URL: u, NumRequests: 1})
+			skel = append(skel, types.Source{URL: "tracker:" + u, NumRequests: 1})
 		}
 		e.cachedSources = skel
 		e.annoExpiry = now.Add(annoTTL)
@@ -1683,14 +1777,21 @@ func (e *engine) stats(idx int, touch bool) *types.Stats {
 	}
 
 	s := &types.Stats{
-		InfoHash:          e.infoHash,
-		Name:              e.t.Name(),
-		Peers:             activePeers,
-		Unchoked:          activePeers,
-		Queued:            ts.HalfOpenPeers,
-		Unique:            totalPeers,
-		ConnectionTries:   0,
-		SwarmPaused:       false,
+		InfoHash: e.infoHash,
+		Name:     e.t.Name(),
+		Peers:    activePeers,
+		// server.js: unchoked = wires that are not choking us; we approximate as
+		// active peers (anacrolix does not expose per-wire choke state here).
+		Unchoked: activePeers,
+		// queued = peers awaiting a connection slot: half-open dials in flight,
+		// plus peers still pending discovery in anacrolix's dial queue.
+		Queued: halfOpen + pending,
+		Unique: totalPeers,
+		// connectionTries = cumulative dial churn (see the accumulation above).
+		ConnectionTries: connTries,
+		// swarmPaused reflects the soft-limit peer-discovery pause, which is the
+		// state server.js exposes as e.swarm.paused.
+		SwarmPaused:       swarmPaused,
 		SwarmConnections:  activePeers,
 		SwarmSize:         totalPeers,
 		Selections:        nil,
@@ -1702,7 +1803,7 @@ func (e *engine) stats(idx int, touch bool) *types.Stats {
 		UploadSpeed:       ulSpeed,
 		Sources:           sources,
 		Opts:              opts,
-		PeerSearchRunning: true,
+		PeerSearchRunning: !swarmPaused,
 	}
 
 	// Per-file extras when a file index is requested. stremio-core's Statistics
