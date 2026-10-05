@@ -12,6 +12,9 @@ Type=simple
 # Packaged defaults, then the per-user override (later files win).
 EnvironmentFile=-/etc/stremio-server/stremio-server.env
 EnvironmentFile=-%h/.config/stremio-server/env
+# Create the data dir outside the sandbox ("+"): ProtectHome=read-only would
+# otherwise stop the server creating it, and ReadWritePaths needs it to exist.
+ExecStartPre=+/usr/bin/mkdir -p %h/.stremio-server
 ExecStart=/usr/bin/stremio-server
 Restart=on-failure
 RestartSec=5
@@ -23,7 +26,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.stremio-server
+ReadWritePaths=-%h/.stremio-server
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
