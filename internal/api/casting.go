@@ -41,6 +41,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -464,7 +465,7 @@ func (s *server) castingLoad(w http.ResponseWriter, client *av1.AVTransport1, de
 	// which SetAVTransportURI+Play already does. A seek failure here must
 	// not fail the load response: playback already started successfully.
 	if rawTime := params.Get("time"); rawTime != "" {
-		if ms, err := strconv.ParseFloat(rawTime, 64); err == nil && ms > 0 {
+		if ms, err := strconv.ParseFloat(rawTime, 64); err == nil && ms > 0 && validSeekSecs(ms/1000) {
 			target, err := seekToSecs(client, ms/1000)
 			if err != nil {
 				logging.For("casting").Debug("resume seek after load failed",
@@ -565,7 +566,7 @@ func (s *server) castingSeek(w http.ResponseWriter, client *av1.AVTransport1, de
 		return
 	}
 	secs, err := strconv.ParseFloat(rawTime, 64)
-	if err != nil {
+	if err != nil || !validSeekSecs(secs) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing or invalid time parameter"})
 		return
 	}
@@ -610,12 +611,23 @@ func xmlEscape(s string) string {
 	return buf.String()
 }
 
+// maxSeekSecs bounds accepted seek targets (100 hours).
+const maxSeekSecs = 100 * 3600
+
+// validSeekSecs reports whether secs is finite, non-negative and sane.
+func validSeekSecs(secs float64) bool {
+	return !math.IsNaN(secs) && !math.IsInf(secs, 0) && secs >= 0 && secs <= maxSeekSecs
+}
+
 // secsToHHMMSS converts seconds (float) to "HH:MM:SS" for a UPnP Seek target.
+// Non-finite or negative values clamp to 0; huge values clamp to maxSeekSecs.
 func secsToHHMMSS(secs float64) string {
-	total := int(secs)
-	if total < 0 {
-		total = 0
+	if math.IsNaN(secs) || secs < 0 {
+		secs = 0
+	} else if secs > maxSeekSecs {
+		secs = maxSeekSecs
 	}
+	total := int(secs)
 	h := total / 3600
 	m := (total % 3600) / 60
 	sec := total % 60
