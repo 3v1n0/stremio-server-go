@@ -339,11 +339,19 @@ func ensureIMDBResolved(localHex, title string, year int, ctype, absPath string)
 		imdbPendMu.Unlock()
 		return
 	}
+	// Acquire a semaphore slot before spawning: when all slots are busy the
+	// file is left unresolved and retried on the next scan, so a large library
+	// never parks one goroutine per file waiting on the semaphore.
+	select {
+	case imdbSem <- struct{}{}:
+	default:
+		imdbPendMu.Unlock()
+		return
+	}
 	imdbPending[localHex] = true
 	imdbPendMu.Unlock()
 
 	go func() {
-		imdbSem <- struct{}{} // acquire semaphore slot before any network I/O
 		defer func() {
 			<-imdbSem // release slot
 			imdbPendMu.Lock()

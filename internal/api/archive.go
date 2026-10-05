@@ -378,7 +378,7 @@ func archiveLargestVideo(files []archive.Entry) string {
 	var best archive.Entry
 	for _, f := range files {
 		ext := strings.ToLower(filepath.Ext(f.Name))
-		if archiveVideoExts[ext] && f.Size > best.Size {
+		if archiveVideoExts[ext] && (best.Name == "" || f.Size > best.Size) {
 			best = f
 		}
 	}
@@ -740,22 +740,27 @@ func archiveExtractEntryUncached(sess *archiveSession, entryName string) (string
 	if err != nil {
 		return "", fmt.Errorf("list archive: %w", err)
 	}
-	var declaredSize int64 = -1
+	declaredSize := int64(-1)
+	sizeUnknown := false
 	for _, e := range entries {
 		if e.Name == entryName {
-			declaredSize = e.Size
+			declaredSize, sizeUnknown = e.Size, e.SizeUnknown
 			break
 		}
 	}
 	if declaredSize < 0 {
 		return "", fmt.Errorf("entry %q not found in archive", entryName)
 	}
+	if sizeUnknown {
+		// Size not recorded (streamed RAR): extract until EOF, still bounded
+		// by archiveMaxEntryBytes via the copy limit below.
+		declaredSize = archiveMaxEntryBytes
+	}
 	if declaredSize > archiveMaxEntryBytes {
 		// Reject before opening the entry to avoid unnecessary I/O; rc is not
 		// yet open at this point (r.Open is called below).
 		return "", fmt.Errorf("entry %q: declared size %d exceeds limit %d bytes", entryName, declaredSize, archiveMaxEntryBytes)
 	}
-
 	rc, err := r.Open(entryName)
 	if err != nil {
 		return "", fmt.Errorf("open entry %q: %w", entryName, err)
