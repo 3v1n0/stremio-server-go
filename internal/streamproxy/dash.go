@@ -84,6 +84,24 @@ func dashQueryEscape(s string) string {
 	return e
 }
 
+// dashTemplateTokenParams returns the token params for a SegmentTemplate URL
+// whose d still contains $...$ placeholders: the destination is bound to the
+// literal prefix before the first '$' (so the expanded URL stays on the same
+// origin and path prefix). When that prefix is too short to pin an origin and
+// path (placeholder inside the scheme/host), nil is returned and the token
+// is bound by endpoint only.
+func dashTemplateTokenParams(abs string) map[string]string {
+	prefix := abs
+	if i := strings.IndexByte(abs, '$'); i >= 0 {
+		prefix = abs[:i]
+	}
+	_, rest, ok := strings.Cut(prefix, "://")
+	if !ok || !strings.Contains(rest, "/") {
+		return nil
+	}
+	return map[string]string{tokenDestPrefixParam: prefix}
+}
+
 // dashBuildTemplateURL constructs a /proxy/stream URL for a SegmentTemplate
 // initialization or media attribute.  The destination is placed as a plain
 // (non-base64) query-escaped value so embedded $…$ placeholder tokens remain
@@ -116,9 +134,10 @@ func dashBuildTemplateURL(h *Handler, ext, abs string, opts *Options) string {
 		if opts.APIPassword != "" {
 			b.WriteString("&api_password=")
 			b.WriteString(url.QueryEscape(opts.APIPassword))
-		} else if tok := h.subToken(opts, "/proxy/stream", nil); tok != "" {
-			// Token-authorised manifest: mint a path-bound sub-token. params
-			// are nil because d holds unexpanded $...$ placeholders.
+		} else if tok := h.subToken(opts, "/proxy/stream", dashTemplateTokenParams(abs)); tok != "" {
+			// Token-authorised manifest: mint a path-bound sub-token. d holds
+			// unexpanded $...$ placeholders, so it is bound by destination
+			// prefix (see dashTemplateTokenParams) rather than exactly.
 			b.WriteString("&token=")
 			b.WriteString(url.QueryEscape(tok))
 		}

@@ -13,11 +13,17 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 )
 
 var errUnauthorized = errors.New("unauthorized")
 var errForbidden = errors.New("forbidden")
+
+// tokenDestPrefixParam is a reserved token param key: instead of an exact
+// query-parameter match it requires the decoded destination (d) to start with
+// the sealed value. Used for DASH SegmentTemplate sub-tokens.
+const tokenDestPrefixParam = "d_prefix"
 
 // token is the payload sealed inside a signed URL token.
 type token struct {
@@ -58,10 +64,28 @@ func (h *Handler) authorize(r *http.Request) error {
 		}
 		// Bind token to its sealed query parameters. An empty Params map
 		// imposes no constraint (legacy tokens), mirroring the Endpoint check.
+		// A sealed key must appear exactly once with exactly the sealed value
+		// (a duplicate "d" could otherwise be interpreted differently by
+		// different consumers). The reserved key tokenDestPrefixParam binds the
+		// decoded destination to a prefix instead (DASH template URLs whose d
+		// still holds $...$ placeholders at signing time).
 		if len(t.Params) > 0 {
 			q := r.URL.Query()
 			for k, v := range t.Params {
-				if q.Get(k) != v {
+				if k == tokenDestPrefixParam {
+					if !strings.HasPrefix(decodeDest(q.Get("d")), v) {
+						return errUnauthorized
+					}
+					continue
+				}
+				vals := q[k]
+				if len(vals) == 0 {
+					if v != "" {
+						return errUnauthorized
+					}
+					continue
+				}
+				if len(vals) != 1 || vals[0] != v {
 					return errUnauthorized
 				}
 			}

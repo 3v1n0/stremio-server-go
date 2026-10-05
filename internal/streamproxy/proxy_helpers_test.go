@@ -185,6 +185,7 @@ func TestExternalBaseXForwardedProtoHost(t *testing.T) {
 	h := New(Config{})
 	r := httptest.NewRequest("GET", "/", nil)
 	r.Host = "internal:8080"
+	r.RemoteAddr = "127.0.0.1:5555" // trusted reverse proxy
 	r.Header.Set("X-Forwarded-Proto", "https")
 	r.Header.Set("X-Forwarded-Host", "cdn.example.com")
 	got := h.externalBase(r)

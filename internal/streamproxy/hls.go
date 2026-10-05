@@ -15,7 +15,7 @@ import (
 )
 
 // hlsURIAttrRe matches the URI="..." attribute within an HLS tag line.
-var hlsURIAttrRe = regexp.MustCompile(`URI="([^"]*)"`)
+var hlsURIAttrRe = regexp.MustCompile(`(?:^|[:,])URI="([^"]*)"`)
 
 // maxManifestBytes is the maximum number of bytes accepted from an upstream
 // manifest (HLS playlist or MPEG-DASH MPD). Manifests larger than this are
@@ -88,11 +88,14 @@ func hlsServe(h *Handler, w http.ResponseWriter, r *http.Request) {
 //   - Bare URI lines (not starting with '#') are proxied through /proxy/stream,
 //     except when following an #EXT-X-STREAM-INF tag or when the URL contains
 //     ".m3u8", in which case /proxy/hls/manifest.m3u8 is used.
-//   - #EXT-X-KEY and #EXT-X-MAP URI="..." attributes are always routed to
+//   - #EXT-X-KEY, #EXT-X-SESSION-KEY, #EXT-X-MAP, #EXT-X-PART and
+//     #EXT-X-PRELOAD-HINT URI="..." attributes are always routed to
 //     /proxy/stream; all other attributes (METHOD, IV, BYTERANGE, …) are kept.
+//   - #EXT-X-RENDITION-REPORT URI="..." is routed to /proxy/hls/manifest.m3u8.
 //   - #EXT-X-MEDIA and #EXT-X-I-FRAME-STREAM-INF URI="..." attributes are
 //     routed to /proxy/hls/manifest.m3u8 when the URL contains ".m3u8",
 //     otherwise to /proxy/stream.
+//   - URIs with a non-http(s) scheme (data:, skd:, ...) are left untouched.
 func hlsRewrite(h *Handler, r *http.Request, opts *Options, playlist string) string {
 	lines := strings.Split(playlist, "\n")
 	ext := h.externalBase(r)
@@ -119,8 +122,13 @@ func hlsRewrite(h *Handler, r *http.Request, opts *Options, playlist string) str
 			// Bare URI line.
 			// F10: inline resolution against pre-parsed baseURL.
 			abs := line
-			if baseURLErr == nil {
-				if rv, err := url.Parse(line); err == nil {
+			if rv, err := url.Parse(line); err == nil {
+				if hlsNonHTTPScheme(rv) {
+					nextIsVariant = false
+					out = append(out, line)
+					continue
+				}
+				if baseURLErr == nil {
 					abs = baseURL.ResolveReference(rv).String()
 				}
 			}
@@ -136,17 +144,23 @@ func hlsRewrite(h *Handler, r *http.Request, opts *Options, playlist string) str
 
 		// F8: HLS tag names are uppercase by RFC 8216; use direct HasPrefix instead
 		// of strings.ToUpper(line) to avoid a per-line allocation.
-		switch {
-		case strings.HasPrefix(line, "#EXT-X-STREAM-INF:"):
+		tag, _, _ := strings.Cut(line, ":")
+		switch tag {
+		case "#EXT-X-STREAM-INF":
 			// URI follows on the next non-comment line.
 			nextIsVariant = true
 			out = append(out, line)
 
-		case strings.HasPrefix(line, "#EXT-X-KEY") || strings.HasPrefix(line, "#EXT-X-MAP"):
-			// Encryption key or initialization segment: always /proxy/stream.
+		case "#EXT-X-KEY", "#EXT-X-SESSION-KEY", "#EXT-X-MAP", "#EXT-X-PART", "#EXT-X-PRELOAD-HINT":
+			// Encryption key, initialization segment, LL-HLS part or preload
+			// hint: media/key resources, always /proxy/stream.
 			out = append(out, hlsRewriteURIAttr(line, baseURL, ext, opts, h, "/proxy/stream"))
 
-		case strings.HasPrefix(line, "#EXT-X-MEDIA") || strings.HasPrefix(line, "#EXT-X-I-FRAME-STREAM-INF"):
+		case "#EXT-X-RENDITION-REPORT":
+			// LL-HLS rendition report: always a media playlist.
+			out = append(out, hlsRewriteURIAttr(line, baseURL, ext, opts, h, "/proxy/hls/manifest.m3u8"))
+
+		case "#EXT-X-MEDIA", "#EXT-X-I-FRAME-STREAM-INF":
 			// Alternate rendition or I-frame playlist: endpoint depends on URL.
 			out = append(out, hlsRewriteURIAttr(line, baseURL, ext, opts, h, ""))
 
@@ -166,16 +180,25 @@ func hlsRewrite(h *Handler, r *http.Request, opts *Options, playlist string) str
 // automatically: /proxy/hls/manifest.m3u8 when the URL contains ".m3u8",
 // /proxy/stream otherwise.
 // baseURL is the pre-parsed base URL from hlsRewrite (F10); may be nil on parse error.
+// URIs with a non-http(s) scheme (data:, skd:, urn:, ...) and empty URIs are
+// left untouched.
 func hlsRewriteURIAttr(line string, baseURL *url.URL, ext string, opts *Options, h *Handler, fixedEndpoint string) string {
-	sub := hlsURIAttrRe.FindStringSubmatch(line)
-	if sub == nil {
+	loc := hlsURIAttrRe.FindStringSubmatchIndex(line)
+	if loc == nil {
 		return line
 	}
-	ref := sub[1]
+	ref := line[loc[2]:loc[3]]
+	if ref == "" {
+		return line
+	}
 	// F10: inline resolution against pre-parsed baseURL.
 	abs := ref
-	if baseURL != nil {
-		if rv, err := url.Parse(ref); err == nil {
+	rv, err := url.Parse(ref)
+	if err == nil {
+		if hlsNonHTTPScheme(rv) {
+			return line
+		}
+		if baseURL != nil {
 			abs = baseURL.ResolveReference(rv).String()
 		}
 	}
@@ -189,7 +212,13 @@ func hlsRewriteURIAttr(line string, baseURL *url.URL, ext string, opts *Options,
 		}
 	}
 	proxied := h.buildProxyURL(ext, ep, abs, opts)
-	return strings.Replace(line, `URI="`+ref+`"`, `URI="`+proxied+`"`, 1)
+	return line[:loc[2]] + proxied + line[loc[3]:]
+}
+
+// hlsNonHTTPScheme reports whether u carries an explicit scheme other than
+// http or https (data:, skd:, urn:, ...), which the proxy cannot fetch.
+func hlsNonHTTPScheme(u *url.URL) bool {
+	return u.Scheme != "" && u.Scheme != "http" && u.Scheme != "https"
 }
 
 // hlsSegmentURLs returns up to max absolute segment URLs (non-playlist URIs)
@@ -212,8 +241,11 @@ func hlsSegmentURLs(base, playlist string, max int) []string {
 		}
 		// F10: inline resolution against pre-parsed baseURL.
 		abs := line
-		if baseURLErr == nil {
-			if rv, err := url.Parse(line); err == nil {
+		if rv, err := url.Parse(line); err == nil {
+			if hlsNonHTTPScheme(rv) {
+				continue // not fetchable through the proxy
+			}
+			if baseURLErr == nil {
 				abs = baseURL.ResolveReference(rv).String()
 			}
 		}
