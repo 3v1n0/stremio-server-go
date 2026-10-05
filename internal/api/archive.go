@@ -58,8 +58,18 @@ type archiveSession struct {
 	selectedFile string // default entry selected at create time
 	created      time.Time
 	lastAccess   time.Time
-	refCount     int               // in-flight requests; >0 blocks eviction (guarded by mu)
-	extracted    map[string]string // entry name → extracted temp file path (cache)
+	refCount     int                              // in-flight requests; >0 blocks eviction (guarded by mu)
+	extracted    map[string]string                // entry name → extracted temp file path (cache)
+	inflight     map[string]*archiveExtractFlight // entry name → in-progress extraction (guarded by mu)
+}
+
+// archiveExtractFlight is one in-progress extraction of a single archive entry.
+// The goroutine that created it performs the extraction; concurrent requests
+// for the same entry wait on done and share the result (single-flight).
+type archiveExtractFlight struct {
+	done chan struct{}
+	path string
+	err  error
 }
 
 var (
@@ -97,13 +107,72 @@ const archiveMaxEntryBytes int64 = 64 << 30 // 64 GiB
 func archiveStartJanitor() {
 	archiveJanitorOnce.Do(func() {
 		go func() {
+			// Reclaim temp files/dirs leaked by a previous process (crash,
+			// SIGTERM, restart) before serving; then keep sweeping.
+			archiveSweepStale(os.TempDir())
 			t := time.NewTicker(10 * time.Minute)
 			defer t.Stop()
 			for range t.C {
 				archiveEvict()
+				archiveSweepStale(os.TempDir())
 			}
 		}()
 	})
+}
+
+// Temp-name prefixes created by this server for archive sessions. Only names
+// carrying exactly these prefixes are ever swept.
+const (
+	archiveTmpDirPrefix = "stremio-archive-"    // per-session entry dirs (os.MkdirTemp)
+	archiveTmpDLPrefix  = "stremio-archive-dl-" // downloaded archive files (os.CreateTemp)
+)
+
+// archiveSweepStale removes archive session temp dirs and downloaded archive
+// files under root that no live session owns and that have not been modified
+// within archiveSessionTTL. It reclaims space leaked when the process died
+// before its janitor could evict sessions. The age guard keeps a session being
+// created concurrently (or by another instance) safe.
+func archiveSweepStale(root string) {
+	live := map[string]struct{}{}
+	archiveSessionsMu.Lock()
+	for _, sess := range archiveSessions {
+		sess.mu.Lock()
+		live[sess.tmpDir] = struct{}{}
+		live[sess.archivePath] = struct{}{}
+		sess.mu.Unlock()
+	}
+	archiveSessionsMu.Unlock()
+	sweepStaleTemp(root, live, archiveSessionTTL, func(e os.DirEntry) bool {
+		if e.IsDir() {
+			return strings.HasPrefix(e.Name(), archiveTmpDirPrefix)
+		}
+		return e.Type().IsRegular() && strings.HasPrefix(e.Name(), archiveTmpDLPrefix)
+	})
+}
+
+// sweepStaleTemp removes direct children of root that match, are not in live
+// (full paths), and whose modification time is older than minAge. Symlinks are
+// never followed or removed.
+func sweepStaleTemp(root string, live map[string]struct{}, minAge time.Duration, match func(os.DirEntry) bool) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-minAge)
+	for _, e := range entries {
+		if e.Type()&os.ModeSymlink != 0 || !match(e) {
+			continue
+		}
+		full := filepath.Join(root, e.Name())
+		if _, ok := live[full]; ok {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		_ = os.RemoveAll(full)
+	}
 }
 
 func archiveEvict() {
@@ -567,7 +636,7 @@ func archiveDownload(u string) (string, error) {
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("GET %s: status %d", u, resp.StatusCode)
 	}
-	f, err := os.CreateTemp("", "stremio-archive-dl-*")
+	f, err := os.CreateTemp("", archiveTmpDLPrefix+"*")
 	if err != nil {
 		return "", err
 	}
@@ -609,17 +678,56 @@ func archiveEncodePath(name string) string {
 // archiveExtractEntry extracts entryName from the session's archive to a temp
 // file under sess.tmpDir, returning the temp file path. Subsequent calls for
 // the same entryName return the cached path without re-extraction. Concurrent
-// calls for the same entry are handled safely: only one extraction occurs and
-// duplicate work is discarded.
+// calls for the same entry are single-flighted per entry: exactly one goroutine
+// extracts while the others wait and share its result. A failed extraction is
+// not cached, so a later request may retry.
 func archiveExtractEntry(sess *archiveSession, entryName string) (string, error) {
-	// Fast path: already extracted.
 	sess.mu.Lock()
+	// Fast path: already extracted.
 	if p, ok := sess.extracted[entryName]; ok {
 		sess.mu.Unlock()
 		return p, nil
 	}
+	// Another request is already extracting this entry: wait for it.
+	if fl, ok := sess.inflight[entryName]; ok {
+		sess.mu.Unlock()
+		<-fl.done
+		return fl.path, fl.err
+	}
+	fl := &archiveExtractFlight{done: make(chan struct{})}
+	if sess.inflight == nil {
+		sess.inflight = make(map[string]*archiveExtractFlight)
+	}
+	sess.inflight[entryName] = fl
 	sess.mu.Unlock()
 
+	path, err := archiveExtractEntryUncached(sess, entryName)
+
+	sess.mu.Lock()
+	if err == nil {
+		if sess.extracted == nil {
+			sess.extracted = make(map[string]string)
+		}
+		sess.extracted[entryName] = path
+	}
+	delete(sess.inflight, entryName)
+	fl.path, fl.err = path, err
+	sess.mu.Unlock()
+	close(fl.done)
+	return path, err
+}
+
+// archiveExtractTestHook, when non-nil, is called at the start of every real
+// (non-cached, non-waiting) extraction. Tests only.
+var archiveExtractTestHook func(entryName string)
+
+// archiveExtractEntryUncached performs the actual extraction of entryName into
+// a new temp file under sess.tmpDir. Callers must serialise per entry (see
+// archiveExtractEntry).
+func archiveExtractEntryUncached(sess *archiveSession, entryName string) (string, error) {
+	if archiveExtractTestHook != nil {
+		archiveExtractTestHook(entryName)
+	}
 	r, err := archive.OpenFile(sess.archivePath, sess.ext)
 	if err != nil {
 		return "", fmt.Errorf("open archive: %w", err)
@@ -674,17 +782,7 @@ func archiveExtractEntry(sess *archiveSession, entryName string) (string, error)
 		_ = os.Remove(f.Name())
 		return "", fmt.Errorf("extract %q: content (%d bytes) exceeds declared size (%d bytes)", entryName, n, declaredSize)
 	}
-	tmpPath := f.Name()
-
-	// Store under lock; discard our copy if another goroutine finished first.
-	sess.mu.Lock()
-	defer sess.mu.Unlock()
-	if existing, ok := sess.extracted[entryName]; ok {
-		_ = os.Remove(tmpPath)
-		return existing, nil
-	}
-	sess.extracted[entryName] = tmpPath
-	return tmpPath, nil
+	return f.Name(), nil
 }
 
 // ── handler entry point ──────────────────────────────────────────────────────
@@ -802,7 +900,7 @@ func (s *server) archiveHandleCreate(w http.ResponseWriter, r *http.Request, seg
 	if key == "" {
 		key = archiveNewKey()
 	}
-	tmpDir, err := os.MkdirTemp("", "stremio-archive-")
+	tmpDir, err := os.MkdirTemp("", archiveTmpDirPrefix)
 	if err != nil {
 		if isTempArch {
 			_ = os.Remove(archivePath)

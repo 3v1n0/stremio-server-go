@@ -23,6 +23,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -136,11 +137,79 @@ func parseFTPURL(rawURL string) (*ftpParsed, error) {
 	}, nil
 }
 
+// ftpIdleTimeout bounds how long any single read or write on an FTP control
+// or data connection may block with no progress. It is a variable so tests can
+// shorten it.
+var ftpIdleTimeout = 30 * time.Second
+
+// ftpDialTimeout bounds the TCP connect of each FTP control/data connection.
+const ftpDialTimeout = 10 * time.Second
+
+// deadlineConn re-arms a per-operation deadline before every Read and Write so
+// a stalling server cannot block the caller forever. The deadline is the
+// earlier of now+idle and the request context's deadline (when it has one).
+type deadlineConn struct {
+	net.Conn
+	idle  time.Duration
+	ctxDL time.Time
+}
+
+func (c *deadlineConn) arm() {
+	dl := time.Now().Add(c.idle)
+	if !c.ctxDL.IsZero() && c.ctxDL.Before(dl) {
+		dl = c.ctxDL
+	}
+	_ = c.SetDeadline(dl)
+}
+
+func (c *deadlineConn) Read(p []byte) (int, error) {
+	c.arm()
+	return c.Conn.Read(p)
+}
+
+func (c *deadlineConn) Write(p []byte) (int, error) {
+	c.arm()
+	return c.Conn.Write(p)
+}
+
+// ftpConns tracks every raw connection of one FTP session so ctx cancellation
+// can force-close them all, unblocking any goroutine stuck in a Read.
+type ftpConns struct {
+	mu     sync.Mutex
+	conns  []net.Conn
+	closed bool
+}
+
+// add registers c. It reports false (and closes c) when the set was already
+// force-closed.
+func (t *ftpConns) add(c net.Conn) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		_ = c.Close()
+		return false
+	}
+	t.conns = append(t.conns, c)
+	return true
+}
+
+func (t *ftpConns) closeAll() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.closed = true
+	for _, c := range t.conns {
+		_ = c.Close()
+	}
+	t.conns = nil
+}
+
 // ftpReadCloser wraps an FTP data response and its underlying control
 // connection. Close drains the data response then quits the control connection.
 type ftpReadCloser struct {
 	resp *ftp.Response
 	conn *ftp.ServerConn
+	stop func() bool // detaches the ctx-cancellation hook
+	all  *ftpConns
 }
 
 func (f *ftpReadCloser) Read(p []byte) (int, error) {
@@ -148,13 +217,20 @@ func (f *ftpReadCloser) Read(p []byte) (int, error) {
 }
 
 func (f *ftpReadCloser) Close() error {
+	f.stop()
 	err := f.resp.Close()
 	_ = f.conn.Quit()
+	f.all.closeAll()
 	return err
 }
 
 // openFTP opens a data connection for path on the FTP server described by
 // rawURL, positioned at offset bytes from the beginning.
+//
+// Every control and data connection is wrapped with a per-operation deadline
+// (ftpIdleTimeout) and is force-closed when ctx is cancelled, so neither a
+// stalling server nor a disconnected client can pin the goroutine and the FTP
+// session.
 func openFTP(ctx context.Context, rawURL string, offset int64) (io.ReadCloser, int64, error) {
 	p, err := parseFTPURL(rawURL)
 	if err != nil {
@@ -164,26 +240,54 @@ func openFTP(ctx context.Context, rawURL string, offset int64) (io.ReadCloser, i
 		return nil, -1, fmt.Errorf("ftpstream: %w", err)
 	}
 
-	opts := []ftp.DialOption{
-		ftp.DialWithContext(ctx),
-		ftp.DialWithDialer(net.Dialer{
-			Timeout: 10 * time.Second,
-			Control: netguard.DialControl(!ftpAllowPrivate()),
-		}),
+	dialer := net.Dialer{
+		Timeout: ftpDialTimeout,
+		Control: netguard.DialControl(!ftpAllowPrivate()),
 	}
+	var tlsCfg *tls.Config
 	if p.tls {
-		opts = append(opts, ftp.DialWithTLS(&tls.Config{
-			ServerName: p.host,
-		}))
+		tlsCfg = &tls.Config{ServerName: p.host}
+	}
+	ctxDL, _ := ctx.Deadline()
+	all := &ftpConns{}
+	// Registered before the first dial so a cancel during greeting/Login/
+	// SIZE/RETR also aborts the blocked operation.
+	stop := context.AfterFunc(ctx, all.closeAll)
+
+	// dialFunc serves the control connection and every data connection.
+	dialFunc := func(network, address string) (net.Conn, error) {
+		raw, derr := dialer.DialContext(ctx, network, address)
+		if derr != nil {
+			return nil, derr
+		}
+		if !all.add(raw) {
+			return nil, ctx.Err()
+		}
+		c := raw
+		if tlsCfg != nil {
+			// Handshake is deferred to the first Read/Write, which the
+			// deadline wrapper below bounds.
+			c = tls.Client(raw, tlsCfg)
+		}
+		return &deadlineConn{Conn: c, idle: ftpIdleTimeout, ctxDL: ctxDL}, nil
 	}
 
-	conn, err := ftp.Dial(p.addr, opts...)
+	fail := func(conn *ftp.ServerConn) {
+		if conn != nil {
+			_ = conn.Quit()
+		}
+		stop()
+		all.closeAll()
+	}
+
+	conn, err := ftp.Dial(p.addr, ftp.DialWithDialFunc(dialFunc))
 	if err != nil {
+		fail(nil)
 		return nil, -1, fmt.Errorf("ftpstream: dial %s: %w", p.addr, err)
 	}
 
 	if err := conn.Login(p.user, p.pass); err != nil {
-		_ = conn.Quit()
+		fail(conn)
 		return nil, -1, fmt.Errorf("ftpstream: login as %q: %w", p.user, err)
 	}
 
@@ -201,19 +305,16 @@ func openFTP(ctx context.Context, rawURL string, offset int64) (io.ReadCloser, i
 		resp, err = conn.Retr(p.path)
 	}
 	if err != nil {
-		_ = conn.Quit()
+		fail(conn)
 		return nil, -1, fmt.Errorf("ftpstream: RETR %s: %w", p.path, err)
 	}
-
-	// jlaffaye/ftp does not expose context parameters for Login, FileSize,
-	// Retr, or RetrFrom — DialWithContext applies to the initial dial only.
-	// Apply any context deadline to the data-connection response so that
-	// reads respect the caller's deadline/cancellation as closely as possible.
-	if dl, ok := ctx.Deadline(); ok {
-		_ = resp.SetDeadline(dl)
+	if cerr := ctx.Err(); cerr != nil {
+		_ = resp.Close()
+		fail(conn)
+		return nil, -1, fmt.Errorf("ftpstream: %w", cerr)
 	}
 
-	return &ftpReadCloser{resp: resp, conn: conn}, size, nil
+	return &ftpReadCloser{resp: resp, conn: conn, stop: stop, all: all}, size, nil
 }
 
 // ErrRangeNotSatisfiable is returned (wrapped) by Open when the requested
