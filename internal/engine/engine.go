@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 // Package engine wraps anacrolix/torrent to provide the EngineManager and
 // Engine interfaces declared in internal/types. It creates a single dual-stack
 // (IPv4+IPv6, TCP+uTP, BEP32 DHT) torrent Client and exposes idempotent torrent
@@ -77,6 +81,13 @@ type engine struct {
 	prefetched       map[int]struct{} // source file idx -> next-file boundary already prefetched (once each)
 	onceMetaPriority sync.Once        // ensures boundary-piece prioritization runs exactly once
 
+	// boundaryMu serializes explicit piece-priority writes (primeBoundary /
+	// prefetchNext raises vs. releaseBoundary resets) and guards bprio.
+	// Lock order: boundaryMu -> mu. Never held while calling into anacrolix
+	// from a path that already holds mu.
+	boundaryMu sync.Mutex
+	bprio      map[int]torrent.PiecePriority // piece idx -> priority last set explicitly via Piece.SetPriority
+
 	// Soft-limit peer-discovery pause state (see manager.SetSoftLimitFn /
 	// enforceSoftLimit). softSample is a dedicated bandwidth checkpoint,
 	// independent of `last` (used by the public Stats() speed calc), so the
@@ -139,6 +150,7 @@ func (e *engine) ensureDownloading(idx int) {
 			files[i].SetPriority(torrent.PiecePriorityNone)
 		}
 	}
+	e.releaseBoundary(demote)
 	if !already {
 		files[idx].Download()
 	}
@@ -379,11 +391,14 @@ func (m *manager) EnsureEngine(infoHash string, opts types.AddOptions) (types.En
 		m.mu.RLock()
 		if e, ok := m.engines[ih]; ok {
 			t := e.t // read e.t under RLock before releasing
-			m.mu.RUnlock()
-			mergeTrackers(t, opts, !m.cfg.DisableWebtorrent)
+			// Touch lastAccess while m.mu is still held: the janitor's
+			// re-check takes m.mu.Lock, so it cannot evict between lookup
+			// and the bump. Lock order m.mu -> e.mu matches the slow path.
 			e.mu.Lock()
 			e.lastAccess = time.Now()
 			e.mu.Unlock()
+			m.mu.RUnlock()
+			mergeTrackers(t, opts, !m.cfg.DisableWebtorrent)
 			return e, nil
 		}
 		waitCh := m.purging[ih]
@@ -1436,6 +1451,7 @@ func (p *pinnedReader) Close() error {
 			if p.idx >= 0 && p.idx < len(files) {
 				files[p.idx].SetPriority(torrent.PiecePriorityNone)
 			}
+			p.e.releaseBoundary([]int{p.idx})
 		}
 	})
 	return p.closeErr
@@ -1487,16 +1503,16 @@ func (e *engine) prefetchNext(idx int) {
 	begin := f.BeginPieceIndex()
 	end := f.EndPieceIndex()
 	const prefetchPieces = 4 // header + index only, opportunistic
-	for i := begin; i < begin+prefetchPieces && i < end; i++ {
-		e.t.Piece(i).SetPriority(torrent.PiecePriorityNormal)
-	}
 	tailStart := end - prefetchPieces
 	if tailStart < begin {
 		tailStart = begin
 	}
-	for i := tailStart; i < end; i++ {
-		e.t.Piece(i).SetPriority(torrent.PiecePriorityNormal)
-	}
+	// Raise-only: a boundary piece already at Now (e.g. shared with the file
+	// being played) must never be lowered to Normal.
+	e.raiseBoundary([]pieceSpan{
+		{begin, min(begin+prefetchPieces, end)},
+		{tailStart, end},
+	}, torrent.PiecePriorityNormal, e.setPiecePriority)
 	logging.For("engine").Debug("prefetched next-file boundary", "info_hash", e.infoHash, "file_idx", next)
 }
 
@@ -1924,16 +1940,133 @@ func (e *engine) primeBoundary(idx int) {
 		return
 	}
 	headEnd, tailBegin := primeBoundaryRange(begin, end, info.PieceLength, headWindowBytes, tailWindowBytes)
-	for i := begin; i < headEnd; i++ {
-		e.t.Piece(i).SetPriority(torrent.PiecePriorityNow)
-	}
-	for i := tailBegin; i < end; i++ {
-		e.t.Piece(i).SetPriority(torrent.PiecePriorityNow)
-	}
+	e.raiseBoundary([]pieceSpan{{begin, headEnd}, {tailBegin, end}}, torrent.PiecePriorityNow, e.setPiecePriority)
 	logging.For("engine").Debug("boundary-prioritized pieces", "info_hash", e.infoHash, "file_idx", idx,
 		"begin", begin, "end", end,
 		"head_bytes", headWindowBytes, "head_pieces", headEnd-begin,
 		"tail_bytes", tailWindowBytes, "tail_pieces", end-tailBegin)
+}
+
+// pieceSpan is a half-open piece index range [begin,end).
+type pieceSpan struct{ begin, end int }
+
+// boundarySpans returns the head and tail piece spans primeBoundary marks Now
+// for a file whose piece range is [begin,end).
+func boundarySpans(begin, end int, pieceLen int64) []pieceSpan {
+	headEnd, tailBegin := primeBoundaryRange(begin, end, pieceLen, headWindowBytes, tailWindowBytes)
+	return []pieceSpan{{begin, headEnd}, {tailBegin, end}}
+}
+
+// piecesToRelease returns the piece indices in demoted that are not covered
+// by any protected span (a piece shared with a file that is still selected,
+// primed or being read must keep its boundary priority). Result is deduplicated
+// and ascending.
+func piecesToRelease(demoted, protected []pieceSpan) []int {
+	keep := map[int]struct{}{}
+	for _, s := range protected {
+		for i := s.begin; i < s.end; i++ {
+			keep[i] = struct{}{}
+		}
+	}
+	seen := map[int]struct{}{}
+	var out []int
+	for _, s := range demoted {
+		for i := s.begin; i < s.end; i++ {
+			if _, ok := keep[i]; ok {
+				continue
+			}
+			if _, ok := seen[i]; ok {
+				continue
+			}
+			seen[i] = struct{}{}
+			out = append(out, i)
+		}
+	}
+	sort.Ints(out)
+	return out
+}
+
+func (e *engine) setPiecePriority(i int, prio torrent.PiecePriority) {
+	e.t.Piece(i).SetPriority(prio)
+}
+
+// raiseBoundary sets prio on every piece in spans whose explicitly-set
+// priority is lower (or unset). It never lowers a piece, so a low-priority
+// prefetch cannot downgrade a boundary piece already at Now.
+func (e *engine) raiseBoundary(spans []pieceSpan, prio torrent.PiecePriority, set func(int, torrent.PiecePriority)) {
+	e.boundaryMu.Lock()
+	defer e.boundaryMu.Unlock()
+	if e.bprio == nil {
+		e.bprio = map[int]torrent.PiecePriority{}
+	}
+	for _, s := range spans {
+		for i := s.begin; i < s.end; i++ {
+			if cur, ok := e.bprio[i]; ok && cur >= prio {
+				continue
+			}
+			e.bprio[i] = prio
+			set(i, prio)
+		}
+	}
+}
+
+// releaseBoundary resets the explicitly-set boundary piece priorities of the
+// demoted files back to None (File.SetPriority(None) does not touch the
+// separate per-piece priority), skipping pieces shared with a file that is
+// still selected, primed or being read.
+func (e *engine) releaseBoundary(demoted []int) {
+	if len(demoted) == 0 || !e.hasInfo() {
+		return
+	}
+	info := e.t.Info()
+	if info == nil {
+		return
+	}
+	files := e.t.Files()
+	spansOf := func(i int) []pieceSpan {
+		if i < 0 || i >= len(files) {
+			return nil
+		}
+		return boundarySpans(files[i].BeginPieceIndex(), files[i].EndPieceIndex(), info.PieceLength)
+	}
+
+	e.boundaryMu.Lock()
+	defer e.boundaryMu.Unlock()
+	e.mu.Lock()
+	keep := map[int]struct{}{}
+	for i := range e.selected {
+		keep[i] = struct{}{}
+	}
+	for i := range e.primed {
+		keep[i] = struct{}{}
+	}
+	for i, n := range e.reading {
+		if n > 0 {
+			keep[i] = struct{}{}
+		}
+	}
+	e.mu.Unlock()
+	var demotedSpans, protected []pieceSpan
+	for _, d := range demoted {
+		delete(keep, d)
+		demotedSpans = append(demotedSpans, spansOf(d)...)
+	}
+	for i := range keep {
+		protected = append(protected, spansOf(i)...)
+	}
+	e.releasePieces(piecesToRelease(demotedSpans, protected), e.setPiecePriority)
+}
+
+// releasePieces resets pieces we explicitly raised back to None. Caller holds
+// boundaryMu.
+func (e *engine) releasePieces(pieces []int, set func(int, torrent.PiecePriority)) {
+	for _, i := range pieces {
+		if _, ok := e.bprio[i]; !ok {
+			continue // never raised by us
+		}
+		delete(e.bprio, i)
+		set(i, torrent.PiecePriorityNone)
+	}
 }
 
 // peerBudget derives the anacrolix per-torrent connection budget from a single

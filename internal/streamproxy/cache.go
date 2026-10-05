@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 package streamproxy
 
 import (
@@ -42,6 +46,9 @@ type segCache struct {
 	totalBytes int64
 	items      map[string]*list.Element
 	lru        *list.List
+
+	janitorOnce sync.Once
+	sweepEvery  time.Duration // janitor interval override (0 = derived from ttl)
 }
 
 // newSegCache creates a segCache with the given TTL and entry cap.
@@ -56,9 +63,46 @@ func newSegCache(ttl time.Duration, maxEntries int) *segCache {
 	}
 }
 
+// startJanitor launches, at most once, the background sweep that drops
+// expired entries. Without it an expired entry would linger until it was
+// touched again or pushed out by LRU/byte-budget eviction.
+func (c *segCache) startJanitor() {
+	c.janitorOnce.Do(func() {
+		interval := c.sweepEvery
+		if interval <= 0 {
+			interval = min(max(c.ttl/2, time.Second), time.Minute)
+		}
+		go func() {
+			t := time.NewTicker(interval)
+			defer t.Stop()
+			for range t.C {
+				c.sweep()
+			}
+		}()
+	})
+}
+
+// sweep removes every expired entry.
+func (c *segCache) sweep() {
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for el := c.lru.Back(); el != nil; {
+		prev := el.Prev()
+		e := el.Value.(*cacheEntry)
+		if now.After(e.expiresAt) {
+			c.totalBytes -= e.size
+			delete(c.items, e.key)
+			c.lru.Remove(el)
+		}
+		el = prev
+	}
+}
+
 // putFull stores a full response entry (body + headers + status).
 // It evicts least-recently-used entries to satisfy both the entry cap and the byte budget.
 func (c *segCache) putFull(key string, val []byte, hdr http.Header, status int) {
+	c.startJanitor()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	newSize := int64(len(val))
@@ -167,6 +211,33 @@ func cacheKey(rawurl string, hdr http.Header) string {
 	return hex.EncodeToString(buf[:])
 }
 
+// cacheableResponse reports whether resp may be buffered into the segment
+// cache: a 200 with a known Content-Length no larger than maxSegmentBytes.
+// Anything else must be streamed to avoid unbounded buffering.
+func cacheableResponse(resp *http.Response) bool {
+	return resp.StatusCode == http.StatusOK &&
+		resp.ContentLength >= 0 && resp.ContentLength <= maxSegmentBytes
+}
+
+// cacheLookup returns a cached response for (rawurl, hdr), if present.
+func (h *Handler) cacheLookup(rawurl string, hdr http.Header) ([]byte, http.Header, int, bool) {
+	if h.cache == nil {
+		return nil, nil, 0, false
+	}
+	entry := h.cache.getFull(cacheKey(rawurl, hdr))
+	if entry == nil {
+		return nil, nil, 0, false
+	}
+	if entry.hdr != nil {
+		// F6: return stored clone directly; callers only read the map.
+		return entry.val, entry.hdr, entry.status, true
+	}
+	// hdr was nil at store time — synthesise a minimal Content-Length header.
+	outHdr := make(http.Header)
+	outHdr.Set("Content-Length", strconv.Itoa(len(entry.val)))
+	return entry.val, outHdr, entry.status, true
+}
+
 // cachedFetch fetches rawurl, using the segment cache when configured.
 // Returns body, response headers, HTTP status, and any error.
 func (h *Handler) cachedFetch(ctx context.Context, rawurl string, hdr http.Header, proxyURL string) ([]byte, http.Header, int, error) {
@@ -189,19 +260,44 @@ func (h *Handler) cachedFetch(ctx context.Context, rawurl string, hdr http.Heade
 	}
 
 	// Cache hit.
-	if entry := h.cache.getFull(cacheKey(rawurl, hdr)); entry != nil {
-		if entry.hdr != nil {
-			// F6: return stored clone directly; callers (copyAllowedHeaders,
-			// applyRespHeaders) only read the map — no defensive copy needed.
-			return entry.val, entry.hdr, entry.status, nil
-		}
-		// hdr was nil at store time — synthesise a minimal Content-Length header.
-		outHdr := make(http.Header)
-		outHdr.Set("Content-Length", strconv.Itoa(len(entry.val)))
-		return entry.val, outHdr, entry.status, nil
+	if data, respHdr, status, ok := h.cacheLookup(rawurl, hdr); ok {
+		return data, respHdr, status, nil
 	}
 
-	// Cache miss — fetch, store, return.
+	// Cache miss — single-flight: concurrent misses for the same key share
+	// one upstream fetch.
+	key := cacheKey(rawurl, hdr)
+	call, leader := h.flightJoin(key)
+	if !leader {
+		select {
+		case <-call.done:
+		case <-ctx.Done():
+			return nil, nil, 0, ctx.Err()
+		}
+		if call.err == nil {
+			return call.data, call.hdr, call.status, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, nil, 0, err
+		}
+		// The leader failed (possibly because its own context was cancelled):
+		// retry independently rather than inherit its error.
+		return h.fetchAndStore(ctx, key, rawurl, hdr, proxyURL)
+	}
+	defer func() { h.flightFinish(key, call) }()
+	// Another leader may have populated the cache between the lookup above
+	// and winning the flight.
+	if data, respHdr, status, ok := h.cacheLookup(rawurl, hdr); ok {
+		call.data, call.hdr, call.status = data, respHdr, status
+		return data, respHdr, status, nil
+	}
+	call.data, call.hdr, call.status, call.err = h.fetchAndStore(ctx, key, rawurl, hdr, proxyURL)
+	return call.data, call.hdr, call.status, call.err
+}
+
+// fetchAndStore performs the upstream GET for a cache miss, buffering at most
+// maxSegmentBytes, and stores a 200 response in the cache under key.
+func (h *Handler) fetchAndStore(ctx context.Context, key, rawurl string, hdr http.Header, proxyURL string) ([]byte, http.Header, int, error) {
 	resp, err := h.fetch(ctx, http.MethodGet, rawurl, hdr, nil, proxyURL)
 	if err != nil {
 		return nil, nil, 0, err
@@ -218,9 +314,57 @@ func (h *Handler) cachedFetch(ctx context.Context, rawurl string, hdr http.Heade
 			fmt.Errorf("upstream segment too large to cache (> %d bytes)", maxSegmentBytes)
 	}
 	if resp.StatusCode == http.StatusOK {
-		h.cache.putFull(cacheKey(rawurl, hdr), data, resp.Header.Clone(), resp.StatusCode)
+		h.cache.putFull(key, data, resp.Header.Clone(), resp.StatusCode)
 	}
 	return data, resp.Header, resp.StatusCode, nil
+}
+
+// flightCall is one in-flight upstream segment fetch shared by concurrent
+// callers; the result fields are valid once done is closed.
+type flightCall struct {
+	done   chan struct{}
+	data   []byte
+	hdr    http.Header
+	status int
+	err    error
+}
+
+// flightJoin registers interest in key. The first caller becomes the leader
+// (leader == true) and must call flightFinish; later callers receive the same
+// call and wait on call.done.
+func (h *Handler) flightJoin(key string) (call *flightCall, leader bool) {
+	h.flightMu.Lock()
+	defer h.flightMu.Unlock()
+	if c, ok := h.flights[key]; ok {
+		return c, false
+	}
+	c := &flightCall{done: make(chan struct{})}
+	h.flights[key] = c
+	return c, true
+}
+
+// flightFinish unregisters the call and releases its waiters.
+func (h *Handler) flightFinish(key string, c *flightCall) {
+	h.flightMu.Lock()
+	delete(h.flights, key)
+	h.flightMu.Unlock()
+	close(c.done)
+}
+
+// awaitFlight blocks while a fetch for key is in flight (e.g. a prefetch
+// warming the segment a client has just requested), bounded by ctx. It does
+// not register a new flight; callers re-check the cache afterwards.
+func (h *Handler) awaitFlight(ctx context.Context, key string) {
+	h.flightMu.Lock()
+	c, ok := h.flights[key]
+	h.flightMu.Unlock()
+	if !ok {
+		return
+	}
+	select {
+	case <-c.done:
+	case <-ctx.Done():
+	}
 }
 
 // prefetch asynchronously warms the cache for up to cfg.Prebuffer URLs.

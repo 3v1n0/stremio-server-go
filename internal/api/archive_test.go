@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 // Package api — regression tests for the SSRF pre-flight (validateFetchHost)
 // and local-path allowlist confinement (archiveResolveLocalPath) added to
 // archive.go in response to the security review findings:

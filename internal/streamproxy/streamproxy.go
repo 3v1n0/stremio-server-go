@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 // Package streamproxy implements an HTTP stream proxy with HLS/DASH manifest
 // rewriting, optional segment decryption, signed URLs, and caching.
 package streamproxy
@@ -75,6 +79,10 @@ type Handler struct {
 	// passwordBytes is cfg.Password pre-converted to []byte to avoid a
 	// per-request allocation in the constant-time password comparison (F11).
 	passwordBytes []byte
+	// flightMu guards flights, the in-flight segment fetches used to
+	// de-duplicate concurrent cache misses (see cachedFetch).
+	flightMu sync.Mutex
+	flights  map[string]*flightCall
 }
 
 // New creates a Handler. A nil Client is replaced with http.DefaultClient.
@@ -112,6 +120,7 @@ func New(cfg Config) *Handler {
 		signingGCM:   gcm,
 		// Pre-convert password bytes once to avoid per-request allocation (F11).
 		passwordBytes: []byte(cfg.Password),
+		flights:       make(map[string]*flightCall),
 	}
 }
 
@@ -122,6 +131,13 @@ type Options struct {
 	RespHeaders http.Header
 	APIPassword string
 	Proxy       string // per-request upstream proxy override (socks5/http/https)
+
+	// subTokenExp/subTokenIP carry the validity of the signed token that
+	// authorised this request (zero when it was not token-authorised or the
+	// server has no password). When set, rewritten sub-URLs get a freshly
+	// minted per-URL token instead of an unauthenticated URL.
+	subTokenExp int64
+	subTokenIP  string
 }
 
 // DecryptParams carries segment decryption parameters.
@@ -168,6 +184,44 @@ func (h *Handler) Route(w http.ResponseWriter, r *http.Request, seg []string) bo
 	}
 }
 
+// maxGenerateURLBody caps the /generate_url request body.
+const maxGenerateURLBody = 64 << 10
+
+// maxTokenExpirySeconds bounds expiry_seconds accepted by /generate_url (one
+// year); larger values risk time.Duration overflow and effectively-permanent
+// bearer tokens.
+const maxTokenExpirySeconds = 365 * 24 * 3600
+
+// validEndpoint reports whether ep is a proxy path a token may be issued for.
+func validEndpoint(ep string) bool {
+	switch {
+	case ep == "/proxy/stream", ep == "/proxy/ip":
+		return true
+	case strings.HasPrefix(ep, "/proxy/hls/"), strings.HasPrefix(ep, "/proxy/mpd/"):
+		return !strings.ContainsAny(ep, "?#\\ ")
+	}
+	return false
+}
+
+// validateGenerateRequest checks the /generate_url input: the endpoint must be
+// a known proxy path, expiry_seconds must be within (0, maxTokenExpirySeconds],
+// and a bound destination (params.d, plain or base64) must be an http(s) URL.
+func validateGenerateRequest(endpoint string, params map[string]string, expirySeconds int) error {
+	if !validEndpoint(endpoint) {
+		return errors.New("unknown endpoint")
+	}
+	if expirySeconds < 1 || expirySeconds > maxTokenExpirySeconds {
+		return fmt.Errorf("expiry_seconds must be between 1 and %d", maxTokenExpirySeconds)
+	}
+	if d, ok := params["d"]; ok {
+		u, err := url.Parse(decodeDest(d))
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return errors.New("params.d must be an http(s) URL")
+		}
+	}
+	return nil
+}
+
 // HandleGenerateURL handles POST /generate_url and returns a signed token URL.
 //
 // @Summary  Generate a signed, expiring proxy URL
@@ -194,16 +248,30 @@ func (h *Handler) HandleGenerateURL(w http.ResponseWriter, r *http.Request) {
 		ExpirySeconds int               `json:"expiry_seconds"`
 		IP            string            `json:"ip"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxGenerateURLBody)).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON body", http.StatusBadRequest)
 		return
+	}
+	if err := validateGenerateRequest(req.Endpoint, req.Params, req.ExpirySeconds); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	ipBind := ""
+	if req.IP != "" {
+		ip := net.ParseIP(strings.TrimSpace(req.IP))
+		if ip == nil {
+			http.Error(w, "invalid ip", http.StatusBadRequest)
+			return
+		}
+		// Canonical form: verifyToken compares against net.IP.String().
+		ipBind = ip.String()
 	}
 	exp := time.Now().Add(time.Duration(req.ExpirySeconds) * time.Second).Unix()
 	tok := token{
 		Endpoint: req.Endpoint,
 		Params:   req.Params,
 		Exp:      exp,
-		IP:       req.IP,
+		IP:       ipBind,
 	}
 	signed, err := h.signToken(tok)
 	if err != nil {
@@ -250,25 +318,32 @@ func (h *Handler) HandleBase64(w http.ResponseWriter, r *http.Request, seg []str
 	}
 }
 
-// parseOptions decodes proxy request parameters from the query string.
-// '+' in d is replaced with space before URL/base64 detection.
-func (h *Handler) parseOptions(r *http.Request) (*Options, error) {
-	q := r.URL.Query()
-	raw := strings.ReplaceAll(q.Get("d"), "+", " ")
-
-	var dest string
+// decodeDest decodes the d parameter value into a destination URL: a plain
+// http(s) URL is used as-is; otherwise it is decoded as base64url (raw) or
+// standard base64 and, failing both, returned unchanged for the caller to
+// validate. A literal '+' in a plain URL is preserved (url.Query already
+// turns unencoded '+' into space; %2B stays '+'). For standard base64 a space
+// is mapped back to '+', the only way an unencoded '+' survives query parsing.
+func decodeDest(raw string) string {
 	switch {
 	case strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://"):
-		dest = raw
-	case raw != "":
-		if b, err := base64.RawURLEncoding.DecodeString(raw); err == nil {
-			dest = string(b)
-		} else if b, err := base64.StdEncoding.DecodeString(raw); err == nil {
-			dest = string(b)
-		} else {
-			dest = raw // keep as-is; caller validates
-		}
+		return raw
+	case raw == "":
+		return ""
 	}
+	if b, err := base64.RawURLEncoding.DecodeString(raw); err == nil {
+		return string(b)
+	}
+	if b, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(raw, " ", "+")); err == nil {
+		return string(b)
+	}
+	return raw // keep as-is; caller validates
+}
+
+// parseOptions decodes proxy request parameters from the query string.
+func (h *Handler) parseOptions(r *http.Request) (*Options, error) {
+	q := r.URL.Query()
+	dest := decodeDest(q.Get("d"))
 
 	// Validate proxy param: accept only socks5/socks5h/http/https schemes.
 	var proxyParam string
@@ -296,6 +371,19 @@ func (h *Handler) parseOptions(r *http.Request) (*Options, error) {
 		} else if after, ok := strings.CutPrefix(k, "r_"); ok {
 			for _, v := range vs {
 				opts.RespHeaders.Add(after, v)
+			}
+		}
+	}
+	// Token-authorised manifest requests carry no api_password, so rewritten
+	// sub-URLs would be unauthenticated and rejected when a password is set.
+	// Remember the parent token's expiry and IP binding so buildProxyURL can
+	// mint per-sub-URL tokens (a token is bound to its endpoint and params
+	// and cannot simply be copied across).
+	if opts.APIPassword == "" && h.cfg.Password != "" && len(h.cfg.Secret) > 0 {
+		if tok := q.Get("token"); tok != "" {
+			if t, err := h.verifyToken(tok, clientIP(r)); err == nil {
+				opts.subTokenExp = t.Exp
+				opts.subTokenIP = t.IP
 			}
 		}
 	}
@@ -346,19 +434,92 @@ func (h *Handler) fetch(ctx context.Context, method, rawurl string, hdr http.Hea
 	return h.clientFor(proxyURL).Do(req)
 }
 
+// firstForwardedValue returns the first comma-separated element of a
+// forwarded header value, trimmed.
+func firstForwardedValue(v string) string {
+	first, _, _ := strings.Cut(v, ",")
+	return strings.TrimSpace(first)
+}
+
+// validForwardedHost reports whether s is a syntactically valid host[:port]
+// (DNS name, IPv4, or bracketed IPv6, with an optional numeric port).
+func validForwardedHost(s string) bool {
+	if s == "" || len(s) > 255 {
+		return false
+	}
+	var port string
+	if strings.HasPrefix(s, "[") {
+		end := strings.IndexByte(s, ']')
+		if end < 0 || net.ParseIP(s[1:end]) == nil {
+			return false
+		}
+		rest := s[end+1:]
+		if rest != "" {
+			if rest[0] != ':' {
+				return false
+			}
+			port = rest[1:]
+			if port == "" {
+				return false
+			}
+		}
+	} else {
+		host := s
+		if i := strings.LastIndexByte(s, ':'); i >= 0 {
+			host, port = s[:i], s[i+1:]
+			if port == "" {
+				return false
+			}
+		}
+		if host == "" {
+			return false
+		}
+		for i := range len(host) {
+			c := host[i]
+			switch {
+			case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '-', c == '_':
+			default:
+				return false
+			}
+		}
+	}
+	if port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 || len(port) > 5 {
+			return false
+		}
+		for i := range len(port) {
+			if port[i] < '0' || port[i] > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // externalBase returns the external base URL (no trailing slash).
-// Uses cfg.PublicURL if set; otherwise derives from X-Forwarded-Proto/Host or r.Host.
+// cfg.PublicURL wins when set. Otherwise the base is derived from r.Host, and
+// X-Forwarded-Proto / X-Forwarded-Host are honoured only when the immediate
+// peer is a loopback/private address (a reverse proxy); only the first
+// comma-separated element is used, the proto must be http or https, and the
+// host must be a syntactically valid host[:port]. Invalid values are ignored.
 func (h *Handler) externalBase(r *http.Request) string {
 	if h.cfg.PublicURL != "" {
 		return strings.TrimRight(h.cfg.PublicURL, "/")
 	}
 	scheme := "http"
-	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
-		scheme = proto
+	if r.TLS != nil {
+		scheme = "https"
 	}
 	host := r.Host
-	if fh := r.Header.Get("X-Forwarded-Host"); fh != "" {
-		host = fh
+	if isTrustedProxy(peerIP(r)) {
+		switch p := strings.ToLower(firstForwardedValue(r.Header.Get("X-Forwarded-Proto"))); p {
+		case "http", "https":
+			scheme = p
+		}
+		if fh := firstForwardedValue(r.Header.Get("X-Forwarded-Host")); validForwardedHost(fh) {
+			host = fh
+		}
 	}
 	return scheme + "://" + host
 }
@@ -394,6 +555,9 @@ func (h *Handler) buildProxyURL(extBase, endpoint, dest string, opts *Options) s
 		if opts.APIPassword != "" {
 			b.WriteString("&api_password=")
 			b.WriteString(url.QueryEscape(opts.APIPassword))
+		} else if tok := h.subToken(opts, endpoint, map[string]string{"d": base64.RawURLEncoding.EncodeToString([]byte(dest))}); tok != "" {
+			b.WriteString("&token=")
+			b.WriteString(url.QueryEscape(tok))
 		}
 		if opts.Proxy != "" {
 			b.WriteString("&proxy=")
@@ -403,25 +567,56 @@ func (h *Handler) buildProxyURL(extBase, endpoint, dest string, opts *Options) s
 	return b.String()
 }
 
-// clientIP returns the effective client IP.
-// X-Forwarded-For is honoured only when the immediate peer (RemoteAddr) is a
-// loopback or private address — i.e., the request is arriving through a local
-// reverse proxy. Public clients cannot spoof XFF to bypass IP-ACL checks.
-func clientIP(r *http.Request) net.IP {
+// peerIP returns the IP of the immediate TCP peer (r.RemoteAddr), or nil.
+func peerIP(r *http.Request) net.IP {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
 	}
-	peer := net.ParseIP(host)
+	return net.ParseIP(host)
+}
 
-	// Trust XFF only from a local reverse proxy.
-	if peer != nil && netguard.IsPrivate(peer) {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			first := strings.SplitN(xff, ",", 2)[0]
-			if ip := net.ParseIP(strings.TrimSpace(first)); ip != nil {
-				return ip
-			}
+// isTrustedProxy reports whether ip is a loopback or private address, i.e. a
+// peer that may legitimately be a local/same-network reverse proxy (nginx,
+// Caddy, a container-network edge such as the HF Spaces proxy, ...).
+func isTrustedProxy(ip net.IP) bool {
+	return ip != nil && netguard.IsPrivate(ip)
+}
+
+// clientIP returns the effective client IP.
+// X-Forwarded-For is honoured only when the immediate peer (RemoteAddr) is a
+// loopback or private address — i.e., the request is arriving through a local
+// reverse proxy. Public clients cannot spoof XFF to bypass IP-ACL checks.
+//
+// The chain is walked from the right (the hop appended by the nearest proxy)
+// and the first address that is not itself a trusted proxy is returned; the
+// left-most entries are client-controlled and are never preferred over a
+// proxy-appended one. When every hop is a trusted (private) address the
+// left-most entry is used (a LAN client behind a local proxy). An
+// unparseable hop aborts the walk and the immediate peer is returned.
+func clientIP(r *http.Request) net.IP {
+	peer := peerIP(r)
+	if !isTrustedProxy(peer) {
+		return peer
+	}
+	vals := r.Header.Values("X-Forwarded-For")
+	if len(vals) == 0 {
+		return peer
+	}
+	hops := strings.Split(strings.Join(vals, ","), ",")
+	var leftmost net.IP
+	for i := len(hops) - 1; i >= 0; i-- {
+		ip := net.ParseIP(strings.TrimSpace(hops[i]))
+		if ip == nil {
+			return peer
 		}
+		if !isTrustedProxy(ip) {
+			return ip
+		}
+		leftmost = ip
+	}
+	if leftmost != nil {
+		return leftmost
 	}
 	return peer
 }
@@ -477,6 +672,16 @@ func copyAllowedHeaders(w http.ResponseWriter, hdr http.Header) {
 			w.Header().Set(k, v)
 		}
 	}
+}
+
+// setProxySecurityHeaders hardens proxied upstream content: nosniff stops
+// browsers from MIME-sniffing attacker-controlled bytes into HTML/script, and
+// a sandbox CSP strips script/origin privileges should the response be
+// rendered as a document. Set after applyRespHeaders so r_ overrides cannot
+// weaken them.
+func setProxySecurityHeaders(w http.ResponseWriter) {
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "sandbox")
 }
 
 // applyRespHeaders writes RespHeaders overrides to w, skipping any Access-Control-* key.
@@ -570,6 +775,7 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", ct)
 			}
 			applyRespHeaders(w, opts.RespHeaders)
+			setProxySecurityHeaders(w)
 			w.Header().Set("Content-Length", strconv.Itoa(len(decrypted)))
 			w.WriteHeader(http.StatusOK)
 			if r.Method != http.MethodHead {
@@ -585,23 +791,25 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request) {
 		upHdr.Set("Range", rng)
 	}
 
-	// Non-Range GET: use the segment cache when TTL is configured.
-	if r.Method == http.MethodGet && r.Header.Get("Range") == "" && h.cfg.SegCacheTTL > 0 {
-		data, respHdr, status, cErr := h.cachedFetch(ctx, opts.Dest, upHdr, effProxy)
-		if cErr != nil {
-			http.Error(w, "upstream error", http.StatusBadGateway)
+	// Non-Range GET: use the segment cache when configured. Only responses
+	// with a known, small Content-Length are buffered and cached; anything
+	// else (large or chunked bodies, non-200 statuses) is streamed through.
+	useCache := r.Method == http.MethodGet && r.Header.Get("Range") == "" &&
+		h.cfg.SegCacheTTL > 0 && h.cache != nil
+	if useCache {
+		// A prefetch for this very segment may already be in flight; wait for
+		// it (bounded by the request context) instead of fetching twice.
+		h.awaitFlight(ctx, cacheKey(opts.Dest, upHdr))
+		if data, respHdr, status, ok := h.cacheLookup(opts.Dest, upHdr); ok {
+			copyAllowedHeaders(w, respHdr)
+			applyRespHeaders(w, opts.RespHeaders)
+			setProxySecurityHeaders(w)
+			w.WriteHeader(status)
+			_, _ = w.Write(data)
 			return
 		}
-		copyAllowedHeaders(w, respHdr)
-		applyRespHeaders(w, opts.RespHeaders)
-		w.WriteHeader(status)
-		if r.Method != http.MethodHead {
-			_, _ = w.Write(data)
-		}
-		return
 	}
 
-	// Direct streaming path (Range requests, HEAD, or caching off).
 	resp, fetchErr := h.fetch(ctx, r.Method, opts.Dest, upHdr, nil, effProxy)
 	if fetchErr != nil {
 		http.Error(w, "upstream error", http.StatusBadGateway)
@@ -609,8 +817,30 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	if useCache && cacheableResponse(resp) {
+		data, readErr := io.ReadAll(io.LimitReader(resp.Body, maxSegmentBytes+1))
+		if readErr != nil {
+			http.Error(w, "upstream read error", http.StatusBadGateway)
+			return
+		}
+		if int64(len(data)) > maxSegmentBytes {
+			http.Error(w, "upstream segment too large", http.StatusBadGateway)
+			return
+		}
+		h.cache.putFull(cacheKey(opts.Dest, upHdr), data, resp.Header.Clone(), resp.StatusCode)
+		copyAllowedHeaders(w, resp.Header)
+		applyRespHeaders(w, opts.RespHeaders)
+		setProxySecurityHeaders(w)
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(data)
+		return
+	}
+
+	// Direct streaming path (Range requests, HEAD, caching off, or a response
+	// that is unknown-length, too large, or not cacheable).
 	copyAllowedHeaders(w, resp.Header)
 	applyRespHeaders(w, opts.RespHeaders)
+	setProxySecurityHeaders(w)
 	w.WriteHeader(resp.StatusCode)
 	if r.Method != http.MethodHead {
 		bufp := copyBufPool.Get().(*[]byte)

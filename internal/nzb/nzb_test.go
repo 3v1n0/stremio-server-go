@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 package nzb
 
 import (
@@ -183,11 +187,11 @@ func TestDecodeYenc_AllBytesRoundTrip(t *testing.T) {
 }
 
 func TestDecodeYenc_NoYbegin(t *testing.T) {
-	// Without =ybegin, inBody is never set → output should be empty, no error.
+	// Without =ybegin the article is not yEnc: must be an error, no output.
 	var out bytes.Buffer
 	err := DecodeYenc(bytes.NewReader([]byte("some random line\n")), &out)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if err == nil {
+		t.Fatal("expected error for article without =ybegin")
 	}
 	if out.Len() != 0 {
 		t.Errorf("expected empty output without ybegin, got %d bytes", out.Len())

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 package media
 
 import (
@@ -5,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"os/exec"
+	"strings"
 )
 
 // ffprobeOutputLimit is the maximum ffprobe stdout this process will buffer
@@ -61,4 +66,32 @@ func runCapped(cmd *exec.Cmd, limit int64) ([]byte, error) {
 		return nil, waitErr
 	}
 	return data, nil
+}
+
+// stderrCaptureLimit bounds how much subprocess stderr cappedBuffer keeps.
+const stderrCaptureLimit = 64 << 10 // 64 KiB
+
+// cappedBuffer is an io.Writer that keeps at most stderrCaptureLimit bytes and
+// silently discards the rest, so a chatty subprocess cannot grow memory.
+type cappedBuffer struct {
+	buf bytes.Buffer
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	if room := stderrCaptureLimit - c.buf.Len(); room > 0 {
+		if len(p) > room {
+			c.buf.Write(p[:room])
+		} else {
+			c.buf.Write(p)
+		}
+	}
+	return len(p), nil
+}
+
+func (c *cappedBuffer) String() string { return c.buf.String() }
+
+// containsFold reports whether the captured output contains substr,
+// ignoring ASCII case.
+func (c *cappedBuffer) containsFold(substr string) bool {
+	return strings.Contains(strings.ToLower(c.buf.String()), strings.ToLower(substr))
 }

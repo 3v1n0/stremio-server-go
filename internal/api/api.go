@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 // Package api implements the enginefs-compatible HTTP surface that stremio-web
 // expects from a Stremio streaming server. It depends only on the interfaces in
 // internal/types, so the engine/settings/media implementations are pluggable.
@@ -231,6 +235,40 @@ func originAllowed(cfg types.Config, origin string) bool {
 	return false
 }
 
+// crossSiteBlocked reports whether r is a browser-originated cross-site request
+// that carries no Origin header and targets a side-effecting route. Browsers
+// omit Origin on cross-site <img>/<iframe>/link GETs, so originAllowed cannot
+// stop them; they do however always send Sec-Fetch-Site: cross-site. Requests
+// without Sec-Fetch-* (native shells, ffmpeg, curl) and same-origin/same-site/
+// none are unaffected, as is everything when cfg.AllowAllOrigins is set.
+// Media-playback routes (/{ih}/{idx}, /proxy, /hlsv2/..., /yt/{id}) are NOT
+// gated: <video src> and Safari's native HLS legitimately load them
+// cross-site without an Origin (including master.m3u8?mediaURL=).
+func crossSiteBlocked(cfg types.Config, r *http.Request) bool {
+	if cfg.AllowAllOrigins || r.Header.Get("Origin") != "" {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "cross-site") {
+		return false
+	}
+	return sideEffectingRoute(r)
+}
+
+// sideEffectingRoute reports whether the request path addresses a route that
+// mutates state or spawns processes/outbound calls on a plain GET.
+func sideEffectingRoute(r *http.Request) bool {
+	seg := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	first := seg[0]
+	if isInfoHash(first) {
+		return len(seg) >= 2 && (seg[1] == "create" || seg[1] == "remove")
+	}
+	switch first {
+	case "removeAll", "get-https", "casting":
+		return true
+	}
+	return false
+}
+
 // Shared, immutable streaming header values — pre-canonicalized keys to avoid
 // per-request key canonicalization (mirrors CORS pattern above).
 // textproto.CanonicalMIMEHeaderKey("transferMode.dlna.org")    = "Transfermode.dlna.org"
@@ -240,7 +278,83 @@ var (
 	streamCacheControl    = []string{"max-age=0, no-cache"}
 	streamTransferMode    = []string{"Streaming"}
 	streamContentFeatures = []string{"DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"}
+	streamNoSniff         = []string{"nosniff"}
+	streamCSPSandbox      = []string{"sandbox"}
 )
+
+// setActiveContentGuards stops upstream/torrent bytes served from this trusted
+// origin from executing as active content: nosniff pins the declared type, and
+// CSP sandbox gives any rendered document an opaque origin (its fetches carry
+// "Origin: null", which originAllowed rejects). Harmless for <video>/<audio>.
+func setActiveContentGuards(h http.Header) {
+	h["X-Content-Type-Options"] = streamNoSniff
+	h["Content-Security-Policy"] = streamCSPSandbox
+}
+
+// sensitiveQueryKeys are query parameters whose values must never reach the
+// access log: lz carries reversible lz-string payloads holding URLs with
+// embedded ftp/nntp/http credentials; the rest are common secret-bearing names.
+var sensitiveQueryKeys = map[string]struct{}{
+	"lz": {}, "apikey": {}, "api_key": {}, "authkey": {}, "token": {},
+	"access_token": {}, "password": {}, "pass": {}, "key": {}, "auth": {},
+}
+
+// userinfoRe matches the userinfo of a URL embedded in a request URI, either
+// literal ("://user:pass@") or percent-encoded ("%3A%2F%2Fuser%3Apass%40").
+var userinfoRe = regexp.MustCompile(`(?i)(://|%3A%2F%2F)[^/?&#\s]*?(?:@|%40)`)
+
+// redactRequestURI returns u.RequestURI() with sensitive query values and any
+// embedded URL credentials replaced by "REDACTED", for the HTTP access log.
+func redactRequestURI(u *url.URL) string {
+	uri := u.RequestURI()
+	if i := strings.IndexByte(uri, '?'); i >= 0 && i+1 < len(uri) {
+		pairs := strings.Split(uri[i+1:], "&")
+		for j, p := range pairs {
+			k, _, found := strings.Cut(p, "=")
+			if !found {
+				continue
+			}
+			name, err := url.QueryUnescape(k)
+			if err != nil {
+				name = k
+			}
+			if _, ok := sensitiveQueryKeys[strings.ToLower(name)]; ok {
+				pairs[j] = k + "=REDACTED"
+			}
+		}
+		uri = uri[:i+1] + strings.Join(pairs, "&")
+	}
+	return userinfoRe.ReplaceAllString(uri, "${1}REDACTED@")
+}
+
+// filterRequestTrackers drops request-supplied tracker URLs whose host is
+// localhost or a literal loopback, unspecified, link-local or cloud-metadata
+// IP, so a request cannot make the torrent client announce to local services
+// (blind SSRF). Public and LAN trackers pass through unchanged.
+func filterRequestTrackers(in []string) []string {
+	if len(in) == 0 {
+		return in
+	}
+	out := make([]string, 0, len(in))
+	for _, tr := range in {
+		u, err := url.Parse(strings.TrimSpace(tr))
+		if err != nil || u.Hostname() == "" {
+			continue
+		}
+		host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+		if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+			continue
+		}
+		if ip := net.ParseIP(host); ip != nil {
+			if ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() ||
+				ip.IsLinkLocalMulticast() || netguard.IsCloudMetadata(ip) {
+				continue
+			}
+		}
+		out = append(out, tr)
+	}
+	return out
+}
 
 // ServeHTTP enforces the Origin allowlist (SEC-1 / Contract 2), applies CORS,
 // handles preflight, and dispatches to the router. A disallowed Origin is
@@ -250,6 +364,10 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	origin := r.Header.Get("Origin")
 	if !originAllowed(s.cfg, origin) {
 		writeJSON(w, http.StatusForbidden, map[string]any{"error": "origin not allowed"})
+		return
+	}
+	if crossSiteBlocked(s.cfg, r) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "cross-site request not allowed"})
 		return
 	}
 	hdr := w.Header()
@@ -276,7 +394,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.route(rec, r)
 		s.accessLog.Info("request",
 			"method", r.Method,
-			"uri", r.URL.RequestURI(),
+			"uri", redactRequestURI(r.URL),
 			"status", rec.StatusOrOK(),
 			"duration_ms", time.Since(start).Milliseconds(),
 			"bytes", rec.Bytes,
@@ -609,7 +727,7 @@ func (s *server) handleStream(w http.ResponseWriter, r *http.Request, ih, idxSeg
 	trackers := q["tr"]
 	mustInc := compileMustInclude(q["f"])
 
-	eng, err := s.em.EnsureEngine(ih, types.AddOptions{Trackers: trackers})
+	eng, err := s.em.EnsureEngine(ih, types.AddOptions{Trackers: filterRequestTrackers(trackers)})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -672,6 +790,7 @@ func (s *server) handleStream(w http.ResponseWriter, r *http.Request, ih, idxSeg
 	// Static DLNA/cache headers: direct canonical-key map assignment avoids
 	// per-request key canonicalization (mirrors the CORS pattern in ServeHTTP).
 	hdr := w.Header()
+	setActiveContentGuards(hdr)
 	hdr["Accept-Ranges"] = streamAcceptRanges
 	hdr["Content-Type"] = []string{mimeByName(f.Name)}
 	hdr["Cache-Control"] = streamCacheControl
@@ -870,6 +989,7 @@ func (s *server) handleCreate(w http.ResponseWriter, r *http.Request, ih string)
 	opts := types.AddOptions{Torrent: body.Torrent}
 	opts.Trackers = append(opts.Trackers, trackersFromSources(peerSearchSources(&body))...)
 	opts.Trackers = append(opts.Trackers, announceFromTorrent(body.Torrent)...)
+	opts.Trackers = filterRequestTrackers(opts.Trackers)
 
 	eng, err := s.em.EnsureEngine(ih, opts)
 	if err != nil {
@@ -1068,6 +1188,7 @@ func (s *server) handlePeers(w http.ResponseWriter, r *http.Request, ih string) 
 func (s *server) handleStreamSubtitles(w http.ResponseWriter, r *http.Request, ih string, idx int) {
 	// Build the local HTTP URL that the subtitle prober will pull from.
 	streamURL := fmt.Sprintf("http://127.0.0.1:%d/%s/%d", s.cfg.HTTPPort, ih, idx)
+	setActiveContentGuards(w.Header())
 	w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
 	// best-effort: WriteSubtitles may fail if the file isn't a subtitle stream
 	_ = s.prober.WriteSubtitles(w, streamURL, "vtt", 0)
@@ -1423,6 +1544,7 @@ func (s *server) handleHLS(w http.ResponseWriter, r *http.Request, seg []string)
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
+	setActiveContentGuards(w.Header())
 	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Cache-Control", "no-cache")
 	http.ServeFile(w, r, path)
@@ -1515,6 +1637,7 @@ func (s *server) handleSubtitles(w http.ResponseWriter, r *http.Request, ext str
 	if o := q.Get("offset"); o != "" {
 		offset, _ = strconv.Atoi(o)
 	}
+	setActiveContentGuards(w.Header())
 	if ext == "vtt" {
 		w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
 	} else {
@@ -1830,10 +1953,11 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request, seg []strin
 			w.Header().Set(k, v)
 		}
 	}
+	setActiveContentGuards(w.Header())
 	for _, h := range opts["r"] { // injected response headers; skip CORS headers the caller must not override
 		if i := strings.IndexByte(h, ':'); i > 0 {
 			k := http.CanonicalHeaderKey(strings.TrimSpace(h[:i]))
-			if strings.HasPrefix(k, "Access-Control-") {
+			if strings.HasPrefix(k, "Access-Control-") || k == "Content-Security-Policy" || k == "X-Content-Type-Options" {
 				continue
 			}
 			w.Header().Set(k, strings.TrimSpace(h[i+1:]))

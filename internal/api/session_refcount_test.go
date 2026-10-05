@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 // Package api — regression tests for the in-flight refcount guard on the nzb
 // and archive session janitors (see nzb.go/nzbEvictIdle and
 // archive.go/archiveEvict): a session with a non-zero refcount must never be

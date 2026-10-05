@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+#
+# SPDX-License-Identifier: MIT
+
 # Smoke test the running stremio-server-go on :11470.
 # Uses a well-seeded, legal public-domain torrent (Sintel, Blender open movie).
 set -euo pipefail

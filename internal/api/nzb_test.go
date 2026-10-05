@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 // Package api — regression test for the SSRF pre-flight added to nzb.go's
 // nzbCreate (shares validateFetchHost with archive.go; see archive_test.go).
 package api

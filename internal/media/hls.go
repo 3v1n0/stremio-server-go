@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 package media
 
 import (
@@ -531,6 +535,9 @@ func parseProbeOutput(out []byte) probeMediaResult {
 		return probeMediaResult{}
 	}
 	d, _ := strconv.ParseFloat(r.Format.Duration, 64)
+	if math.IsNaN(d) || math.IsInf(d, 0) || d <= 0 || d > maxSegIdx*segDur {
+		d = 0 // probe failure: bounds the playlist size writePlaylist emits
+	}
 	var audio []audioStream
 	var subs []subtitleStream
 	var subCount int // tracks 0-based index among subtitle streams
@@ -1114,7 +1121,7 @@ func (m *hlsManager) HLSFile(ctx context.Context, id, name string) (string, stri
 func (s *hlsSession) writePlaylist(path, segPrefix string) error {
 	// Check cache under read-lock; playlist bytes are immutable once duration is set.
 	s.mu.RLock()
-	_, ok := s.playlistData[segPrefix]
+	_, ok := s.playlistData[path]
 	dur := s.duration
 	s.mu.RUnlock()
 	if ok {
@@ -1142,16 +1149,25 @@ func (s *hlsSession) writePlaylist(path, segPrefix string) error {
 	}
 	b.WriteString("#EXT-X-ENDLIST\n")
 	data := []byte(b.String())
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	// Write via temp file + rename so a concurrent reader never sees a
+	// truncated playlist.
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return err
 	}
-	// Store rendered bytes so future requests for the same segPrefix skip the
-	// O(n_segments) format loop and disk write entirely.
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	// Store rendered bytes so future requests for the same path skip the
+	// O(n_segments) format loop and disk write entirely.  Keyed by path, not
+	// segPrefix: playlist.m3u8 and video.m3u8 share prefix "" but are
+	// distinct files.
 	s.mu.Lock()
 	if s.playlistData == nil {
 		s.playlistData = make(map[string]struct{})
 	}
-	s.playlistData[segPrefix] = struct{}{}
+	s.playlistData[path] = struct{}{}
 	s.mu.Unlock()
 	return nil
 }
@@ -1217,9 +1233,22 @@ func (m *hlsManager) extractSubtitle(ctx context.Context, s *hlsSession, k int) 
 		"-f", "webvtt",
 		tmp,
 	)
+	var stderr cappedBuffer
+	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		_ = os.Remove(tmp)
 		return "", fmt.Errorf("hls: subtitle extract %s: %w", filename, err)
+	}
+	// ffmpeg exits 0 after "Stream ends prematurely" (the input was cut
+	// mid-demux) and leaves a partial track behind. Never promote that to
+	// the permanent sub<k>.vtt cache: a later request must re-extract.
+	if stderr.containsFold("ends prematurely") {
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("hls: subtitle extract %s: input truncated: %s", filename, strings.TrimSpace(stderr.String()))
+	}
+	if fi, err := os.Stat(tmp); err != nil || fi.Size() == 0 {
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("hls: subtitle extract %s: ffmpeg produced no output", filename)
 	}
 	if err := os.Rename(tmp, vttFile); err != nil {
 		_ = os.Remove(tmp)
@@ -1904,7 +1933,11 @@ func (m *hlsManager) reaper() {
 // always honoured even when the process-wide TTL is 0.
 func (m *hlsManager) evictIdle() {
 	now := time.Now()
-	var victims []string
+	type victim struct {
+		id string
+		s  *hlsSession
+	}
+	var victims []victim
 	m.mu.Lock()
 	for id, s := range m.sessions {
 		if s.inFlight.Load() > 0 {
@@ -1930,14 +1963,24 @@ func (m *hlsManager) evictIdle() {
 			continue
 		}
 		if time.Unix(0, ts).Before(now.Add(-s.idleTTL(m.cfg.SessionTTL))) {
+			// Park the id in m.draining (like DeleteHLS) so a same-id
+			// StartHLS between here and the RemoveAll below is refused
+			// instead of having its fresh directory wiped.
 			delete(m.sessions, id)
-			victims = append(victims, s.dir)
+			if m.draining == nil {
+				m.draining = map[string]*hlsSession{}
+			}
+			m.draining[id] = s
+			s.deleted.Store(true)
+			victims = append(victims, victim{id: id, s: s})
 		}
 	}
 	m.mu.Unlock()
 	// RemoveAll outside the lock: disk I/O must not stall concurrent requests.
-	for _, dir := range victims {
-		_ = os.RemoveAll(dir)
+	// removeDeletedSession clears the draining entry only after the
+	// directory is gone.
+	for _, v := range victims {
+		m.removeDeletedSession(v.id, v.s)
 	}
 }
 

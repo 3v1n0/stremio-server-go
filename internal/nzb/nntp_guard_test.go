@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 // Package nzb — regression tests for SEC-2 (review 2026-09-22): Dial dialed
 // the client-supplied NNTP host/port with a bare net.Dialer{Timeout:
 // dialTimeout} and no Control hook at all, so a server list pointing at an

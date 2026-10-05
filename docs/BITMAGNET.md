@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+
+SPDX-License-Identifier: MIT
+-->
+
 # Bitmagnet Add-on
 
 The `/bitmagnet` add-on turns a self-hosted [Bitmagnet](https://bitmagnet.io)

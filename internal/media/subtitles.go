@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 package media
 
 import (
@@ -93,14 +97,20 @@ func fetchSubBytes(url, selfBase string) ([]byte, error) {
 	if err := validateRemoteURL(url, selfBase); err != nil {
 		return nil, err
 	}
+	// Map the self-signed https://…:12470 UI origin onto plain http://…:11470:
+	// the client below cannot complete that TLS handshake.
+	if isSelfOrigin(url, selfBase) {
+		url = localize(url)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
-	// openSubClient: shared transport reuses TCP connection for subtitle CDN requests.
-	resp, err := openSubClient.Do(req)
+	// Shared transport reuses the TCP connection for subtitle CDN requests;
+	// this server's own origin goes through the loopback-permitting client.
+	resp, err := subClientFor(url, selfBase).Do(req)
 	if err != nil {
 		return nil, err
 	}

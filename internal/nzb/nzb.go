@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 // Package nzb provides NZB XML parsing, yEnc decoding, and an NNTP client for
 // assembling Usenet files from their individual article segments.
 package nzb

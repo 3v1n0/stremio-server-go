@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 package media
 
 // Tests for opt-in HLS session persistence (persist.go). Offline and

@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+
+SPDX-License-Identifier: MIT
+-->
+
 # Stream Proxy
 
 `stremio-server-go` ships a pure-Go HTTP stream proxy that augments the legacy
@@ -80,9 +86,13 @@ All three modes are optional and composable:
   expiry, and optional pinned client IP. A valid `token` bypasses the password.
   The sealed `params` (including the destination `d`) are enforced against the
   live request: a token only authorizes the exact param values it was minted
-  for, so it cannot be reused to proxy a different destination.
+  for, so it cannot be reused to proxy a different destination. `endpoint`
+  must be `/proxy/stream`, `/proxy/ip`, or under `/proxy/hls/` / `/proxy/mpd/`;
+  `expiry_seconds` is required (1 s to 1 year) and `d` must be an http(s) URL,
+  otherwise the request gets `400`.
 - **IP allowlist** (`STREMIO_PROXY_IP_ACL`) — comma-separated CIDRs; non-matching
-  clients get `403`. The client IP honors `X-Forwarded-For` (first hop).
+  clients get `403`. `X-Forwarded-For` is honoured only from a loopback/private
+  peer, using the right-most hop that is not itself a private address.
 
 Independent of the three modes above, any browser-originated request (one
 carrying an `Origin` header) to `/proxy/*` is also checked against the
@@ -94,7 +104,8 @@ unaffected.
 
 When nothing is configured, the proxy is open to any caller (consistent with the
 server's localhost-trust model), but an SSRF guard still applies: the
-cloud-metadata address (`169.254.169.254`) is **always** blocked, and when the
+cloud-metadata addresses (`169.254.169.254`, `169.254.170.2`, `100.100.100.200`,
+`fd00:ec2::254`) are **always** blocked, and when the
 proxy is "protected" (a password, IP-ACL, or secret is configured) private,
 loopback, link-local, and ULA destinations are blocked as well.
 
@@ -107,7 +118,7 @@ loopback, link-local, and ULA destinations are blocked as well.
 | `STREMIO_PROXY_IP_ACL` | _(unset)_ | Comma-separated CIDR allowlist. Unset = allow all. |
 | `STREMIO_PROXY_PREBUFFER` | `3` | Number of upcoming segments to prefetch. `0` disables. |
 | `STREMIO_PROXY_SEG_CACHE_TTL` | `300` | Segment cache TTL in seconds. `0` disables caching. |
-| `STREMIO_PROXY_PUBLIC_URL` | _(derive)_ | External base URL written into rewritten manifests. Unset = derived from the request (`X-Forwarded-Proto`/`Host`). |
+| `STREMIO_PROXY_PUBLIC_URL` | _(derive)_ | External base URL written into rewritten manifests. Unset = derived from the request; `X-Forwarded-Proto`/`Host` are honoured only from a loopback/private peer (a reverse proxy). |
 | `STREMIO_PROXY_UPSTREAM` | _(unset)_ | Global outbound upstream proxy for all stream-proxy fetches. Overridden per-request by the `proxy` query param. Supported schemes: `socks5`, `socks5h`, `http`, `https`. Example: `socks5://user:pass@proxy.example:1080`. |
 
 `STREMIO_PROXY_PUBLIC_URL` matters behind a reverse proxy or on a hosted
@@ -138,7 +149,7 @@ As with the rest of the server, this is a **localhost-trust** service by
 default. If you expose the proxy to a network, set `STREMIO_PROXY_PASSWORD`
 (and/or `STREMIO_PROXY_IP_ACL`) and prefer signed URLs — otherwise it is an
 open relay that will fetch and decrypt arbitrary public URLs on behalf of any
-caller. An SSRF guard always blocks the cloud-metadata address
+caller. An SSRF guard always blocks cloud-metadata addresses
 (`169.254.169.254`); configuring any auth mechanism (password, IP-ACL, or
 secret) additionally blocks private/loopback/link-local/ULA destinations, and
 the destination IP is re-validated at connect time to defeat DNS rebinding.

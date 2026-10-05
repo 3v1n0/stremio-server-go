@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+#
+# SPDX-License-Identifier: MIT
+
 # Local Bitmagnet (DHT crawler + GraphQL index) for the stremio-server-go /bitmagnet add-on.
 #
 #   podman compose -f deploy/bitmagnet/compose.yaml up -d

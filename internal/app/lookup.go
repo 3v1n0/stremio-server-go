@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 // Package app hosts the reusable server bootstrap (env parsing, subsystem
 // wiring, HTTP/HTTPS listeners, graceful shutdown) shared by the
 // cmd/stremio-server executable and the cmd/libstremio c-shared library.

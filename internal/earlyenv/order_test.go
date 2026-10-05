@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 package earlyenv_test
 
 // External test package on purpose: test files inside package earlyenv would

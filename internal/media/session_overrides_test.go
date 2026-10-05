@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 package media
 
 // Tests for the opt-in per-session HLS overrides on master.m3u8

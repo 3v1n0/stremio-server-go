@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 // Command stremio-server is a lightweight, IPv6-capable drop-in replacement for
 // Stremio's closed-source streaming server (server.js), built on
 // anacrolix/torrent. It serves the enginefs HTTP API that stremio-web expects.
