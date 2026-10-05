@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 // Package api — GET /get-https?authKey=..&ipAddress=..
 //
 // Provisions a TLS certificate from api.strem.io (see certprovision.go for the

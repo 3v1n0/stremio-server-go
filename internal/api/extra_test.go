@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 // Package api — fourth batch of tests covering stream handlers with empty
 // config, eviction routines, archive extraction, and torznab queries.
 package api

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 package netguard
 
 import (
@@ -107,5 +111,21 @@ func TestDialControl(t *testing.T) {
 		t.Error("DialControl on unresolved host = nil, want error")
 	} else if !strings.Contains(err.Error(), "resolved IP") {
 		t.Errorf("unexpected error for unresolved host: %v", err)
+	}
+}
+
+func TestValidateIPExtraMetadataAndNonUnicast(t *testing.T) {
+	for _, s := range []string{"169.254.170.2", "100.100.100.200", "fd00:ec2::254"} {
+		if ValidateIP(net.ParseIP(s), false) == nil {
+			t.Errorf("%s must be blocked even with blockPrivate=false", s)
+		}
+	}
+	for _, s := range []string{"0.0.0.0", "::", "224.0.0.1", "ff02::1", "255.255.255.255"} {
+		if ValidateIP(net.ParseIP(s), true) == nil {
+			t.Errorf("%s must be blocked when blockPrivate", s)
+		}
+	}
+	if ValidateIP(net.ParseIP("8.8.8.8"), true) != nil {
+		t.Error("public IP must pass")
 	}
 }

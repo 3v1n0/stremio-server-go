@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 // Package netguard provides SSRF protection primitives shared across the
 // outbound-fetch paths (proxy, /create blob, ftpstream HTTP). It exposes both a
 // URL/host pre-flight check and a dialer Control hook that re-validates the
@@ -52,27 +56,48 @@ func IsPrivate(ip net.IP) bool {
 	return false
 }
 
-// IsCloudMetadata reports whether ip is the well-known cloud-metadata endpoint
-// 169.254.169.254 (including its IPv4-mapped IPv6 form).
+// metadataIPs are well-known cloud-metadata endpoints, always blocked.
+var metadataIPs = []net.IP{
+	net.ParseIP("169.254.169.254"), // AWS/GCP/Azure/OpenStack IMDS
+	net.ParseIP("169.254.170.2"),   // AWS ECS task metadata
+	net.ParseIP("100.100.100.200"), // Alibaba Cloud
+	net.ParseIP("fd00:ec2::254"),   // AWS IMDS over IPv6
+}
+
+// IsCloudMetadata reports whether ip is a well-known cloud-metadata endpoint
+// (including IPv4-mapped IPv6 forms).
 func IsCloudMetadata(ip net.IP) bool {
 	if ip == nil {
 		return false
 	}
-	ip4 := ip.To4()
-	if ip4 == nil {
-		return false
+	for _, m := range metadataIPs {
+		if m.Equal(ip) {
+			return true
+		}
 	}
-	return ip4[0] == 169 && ip4[1] == 254 && ip4[2] == 169 && ip4[3] == 254
+	return false
 }
 
-// ValidateIP rejects an IP that an outbound fetch must not reach. The
-// cloud-metadata address is always blocked; private/loopback ranges are blocked
-// only when blockPrivate is set (callers exposed to untrusted clients).
+// isNonUnicast reports unspecified, multicast, or IPv4 broadcast addresses.
+func isNonUnicast(ip net.IP) bool {
+	if ip.IsUnspecified() || ip.IsMulticast() {
+		return true
+	}
+	if ip4 := ip.To4(); ip4 != nil && ip4.Equal(net.IPv4bcast) {
+		return true
+	}
+	return false
+}
+
+// ValidateIP rejects an IP that an outbound fetch must not reach. Cloud-metadata
+// addresses are always blocked; private/loopback ranges and
+// unspecified/multicast/broadcast addresses are blocked only when blockPrivate
+// is set (callers exposed to untrusted clients).
 func ValidateIP(ip net.IP, blockPrivate bool) error {
 	if IsCloudMetadata(ip) {
 		return fmt.Errorf("blocked cloud-metadata address %s", ip)
 	}
-	if blockPrivate && IsPrivate(ip) {
+	if blockPrivate && (IsPrivate(ip) || (ip != nil && isNonUnicast(ip))) {
 		return fmt.Errorf("blocked private address %s", ip)
 	}
 	return nil

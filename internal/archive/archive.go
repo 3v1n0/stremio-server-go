@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 // Package archive provides a uniform streaming reader over local archive files
 // (zip, tar, tgz, rar, 7zip). All implementations are pure Go; no cgo or
 // external binaries are required.
@@ -20,9 +24,12 @@ import (
 // Entry describes a single item inside an archive. Directories may appear in
 // the list; callers filter them by checking IsDir.
 type Entry struct {
-	Name  string // forward-slash separated relative path
-	Size  int64
-	IsDir bool
+	Name string // forward-slash separated relative path
+	Size int64
+	// SizeUnknown is true when the archive does not record the unpacked size
+	// (streamed RARs). Size is then 0 and callers must extract until EOF.
+	SizeUnknown bool
+	IsDir       bool
 }
 
 // Reader provides sequential-safe access to an archive's contents. Close must
@@ -283,10 +290,18 @@ func (r *rarReader) List() ([]Entry, error) {
 		if err != nil {
 			return nil, err
 		}
+		size, unknown := hdr.UnPackedSize, hdr.UnKnownSize
+		if size < 0 {
+			size, unknown = 0, true
+		}
+		if unknown {
+			size = 0
+		}
 		out = append(out, Entry{
-			Name:  normName(hdr.Name),
-			Size:  hdr.UnPackedSize,
-			IsDir: hdr.IsDir,
+			Name:        normName(hdr.Name),
+			Size:        size,
+			SizeUnknown: unknown,
+			IsDir:       hdr.IsDir,
 		})
 	}
 	return out, nil

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 // Package api — NZB/Usenet streaming at /nzb/*.
 //
 // Routes:
@@ -85,12 +89,33 @@ var (
 func nzbStartJanitor() {
 	nzbJanitorOnce.Do(func() {
 		go func() {
+			// Reclaim assembled-file dirs leaked by a previous process.
+			nzbSweepStale(os.TempDir())
 			tick := time.NewTicker(10 * time.Minute)
 			defer tick.Stop()
 			for range tick.C {
 				nzbEvictIdle()
+				nzbSweepStale(os.TempDir())
 			}
 		}()
+	})
+}
+
+// nzbTmpDirPrefix is the temp-dir prefix of NZB session dirs; only dirs with
+// exactly this prefix are ever swept.
+const nzbTmpDirPrefix = "stremio-nzb-"
+
+// nzbSweepStale removes NZB session dirs under root that no live session owns
+// and that have not been modified within an hour (leaked by a prior process).
+func nzbSweepStale(root string) {
+	live := map[string]struct{}{}
+	nzbSessionsMu.Lock()
+	for _, sess := range nzbSessions {
+		live[sess.tmpDir] = struct{}{}
+	}
+	nzbSessionsMu.Unlock()
+	sweepStaleTemp(root, live, time.Hour, func(e os.DirEntry) bool {
+		return e.IsDir() && strings.HasPrefix(e.Name(), nzbTmpDirPrefix)
 	})
 }
 
@@ -283,7 +308,7 @@ func (s *server) nzbCreate(w http.ResponseWriter, r *http.Request, key string) {
 	}
 
 	// Create an isolated temp directory for assembled file cache.
-	tmpDir, err := os.MkdirTemp("", "stremio-nzb-")
+	tmpDir, err := os.MkdirTemp("", nzbTmpDirPrefix)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return

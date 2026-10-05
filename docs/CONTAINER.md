@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+
+SPDX-License-Identifier: MIT
+-->
+
 # Container Deployment
 
 The project ships a multi-stage `Dockerfile` (Podman/Docker) that compiles

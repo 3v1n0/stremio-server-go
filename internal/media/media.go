@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 // Package media implements types.MediaProber, backing the ffprobe/ffmpeg helper
 // routes. All external I/O is done via os/exec (ffprobe) or the standard
 // net/http client; no third-party dependencies are required.
@@ -42,6 +46,60 @@ var openSubClient = &http.Client{
 			Control: netguard.DialControl(true),
 		}).DialContext,
 	},
+}
+
+// openSubSelfClient is the openSubClient counterpart for this server's own
+// origin (selfBase). validateRemoteURL deliberately exempts that origin from
+// the private-address check, but openSubClient's dialer would then refuse the
+// loopback connection, so self-origin URLs go through this client instead. It
+// is only ever selected by subClientFor for URLs that match selfBase, and it
+// refuses to follow a redirect off that origin, so it can never be steered at
+// another loopback/private target.
+var openSubSelfClient = &http.Client{
+	Timeout: 15 * time.Second,
+	Transport: &http.Transport{
+		DialContext: (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+	},
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 5 {
+			return fmt.Errorf("stopped after %d redirects", len(via))
+		}
+		if !isSelfOrigin(req.URL.String(), selfBaseOf(via[0].URL.String())) {
+			return fmt.Errorf("redirect to %s leaves the server's own origin", req.URL.Host)
+		}
+		return nil
+	},
+}
+
+// selfBaseOf returns the scheme://host part of raw, used by
+// openSubSelfClient's redirect check to recover the origin the request was
+// pinned to.
+func selfBaseOf(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+// isSelfOrigin reports whether raw (after localize) is selfBase or a path
+// under it. selfBase == "" never matches.
+func isSelfOrigin(raw, selfBase string) bool {
+	if selfBase == "" {
+		return false
+	}
+	l := localize(raw)
+	return l == selfBase || strings.HasPrefix(l, selfBase+"/")
+}
+
+// subClientFor picks the HTTP client for rawURL: the loopback-permitting
+// openSubSelfClient for this server's own origin, the SSRF-guarded
+// openSubClient for everything else.
+func subClientFor(rawURL, selfBase string) *http.Client {
+	if isSelfOrigin(rawURL, selfBase) {
+		return openSubSelfClient
+	}
+	return openSubClient
 }
 
 // probeResultEntry holds a cached Probe() result (or error) with a wall-clock expiry.
@@ -311,7 +369,7 @@ func (p *prober) OpenSubHash(videoURL string) (interface{}, error) {
 	// server's self-signed :12470 certificate.
 	videoURL = localize(videoURL)
 
-	size, head, tail, err := fetchHTTPChunks(videoURL)
+	size, head, tail, err := fetchHTTPChunks(videoURL, p.baseURLLocal)
 	if err != nil {
 		return nil, err
 	}
@@ -367,10 +425,8 @@ func validateRemoteURL(raw, selfBase string) error {
 	if host == "" {
 		return fmt.Errorf("URL %q has no host", raw)
 	}
-	if selfBase != "" {
-		if l := localize(raw); l == selfBase || strings.HasPrefix(l, selfBase+"/") {
-			return nil
-		}
+	if isSelfOrigin(raw, selfBase) {
+		return nil
 	}
 	ips := []net.IP{net.ParseIP(host)}
 	if ips[0] == nil {
@@ -388,33 +444,34 @@ func validateRemoteURL(raw, selfBase string) error {
 
 // fetchHTTPChunks fetches the first and last 64 KiB of a remote file
 // using HTTP Range requests, returning (size, head, tail, err).
-func fetchHTTPChunks(url string) (size int64, head, tail []byte, err error) {
-	// openSubClient: shared transport reuses the TCP connection for HEAD + 2× Range GETs.
+func fetchHTTPChunks(url, selfBase string) (size int64, head, tail []byte, err error) {
+	client := subClientFor(url, selfBase)
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodHead, url, nil)
 	if err != nil {
 		return 0, nil, nil, fmt.Errorf("HEAD %s: %w", url, err)
 	}
-	resp, err := openSubClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return 0, nil, nil, fmt.Errorf("HEAD %s: %w", url, err)
 	}
 	_ = resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return 0, nil, nil, fmt.Errorf("HEAD %s: unexpected status %d", url, resp.StatusCode)
+	}
 	if resp.ContentLength <= 0 {
 		return 0, nil, nil, fmt.Errorf("cannot determine Content-Length for %s", url)
 	}
 	size = resp.ContentLength
 
-	head, err = httpRangeGet(url, 0, int64(chunkSize)-1)
+	headEnd := min(size, int64(chunkSize)) - 1
+	head, err = httpRangeGet(client, url, 0, headEnd)
 	if err != nil {
 		return 0, nil, nil, err
 	}
 
-	tailStart := size - chunkSize
-	if tailStart < 0 {
-		tailStart = 0
-	}
-	tail, err = httpRangeGet(url, tailStart, size-1)
+	tailStart := max(size-chunkSize, 0)
+	tail, err = httpRangeGet(client, url, tailStart, size-1)
 	if err != nil {
 		return 0, nil, nil, err
 	}
@@ -422,11 +479,21 @@ func fetchHTTPChunks(url string) (size int64, head, tail []byte, err error) {
 	return size, head, tail, nil
 }
 
-// httpRangeGet performs a Range GET [from, to] and returns the body.
-// A 15-second context timeout is applied; the body is capped at chunkSize+1 bytes so
-// a server that ignores the Range header and returns a 200 + full body
-// cannot cause an OOM.
-func httpRangeGet(url string, from, to int64) ([]byte, error) {
+// httpRangeGet performs a Range GET [from, to] and returns exactly
+// to-from+1 bytes, or an error. A 15-second context timeout is applied and
+// the read is bounded by the requested length, so a server that ignores the
+// Range header cannot cause an OOM.
+//
+// A 206 response must carry a Content-Range (when present) matching the
+// request. A 200 response means the server ignored Range and is streaming the
+// whole file from byte 0: that is only usable for a request starting at 0;
+// for any other offset it is rejected, since returning the file's prefix as
+// the "tail" would silently produce a wrong OpenSubtitles hash.
+func httpRangeGet(client *http.Client, url string, from, to int64) ([]byte, error) {
+	want := to - from + 1
+	if want <= 0 {
+		return nil, fmt.Errorf("range GET %s: invalid range %d-%d", url, from, to)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -435,15 +502,31 @@ func httpRangeGet(url string, from, to int64) ([]byte, error) {
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", from, to))
 
-	// openSubClient: shared transport; per-request timeout applied via ctx.
-	resp, err := openSubClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		if cr := resp.Header.Get("Content-Range"); cr != "" {
+			var gotFrom, gotTo int64
+			if _, err := fmt.Sscanf(cr, "bytes %d-%d/", &gotFrom, &gotTo); err != nil || gotFrom != from || gotTo != to {
+				return nil, fmt.Errorf("range GET %s: Content-Range %q does not match requested %d-%d", url, cr, from, to)
+			}
+		}
+	case http.StatusOK:
+		if from != 0 {
+			return nil, fmt.Errorf("range GET %s: server ignored Range (status 200) for offset %d", url, from)
+		}
+	default:
 		return nil, fmt.Errorf("range GET %s: unexpected status %d", url, resp.StatusCode)
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, chunkSize+1))
+
+	buf := make([]byte, want)
+	if _, err := io.ReadFull(resp.Body, buf); err != nil {
+		return nil, fmt.Errorf("range GET %s: short body (want %d bytes): %w", url, want, err)
+	}
+	return buf, nil
 }

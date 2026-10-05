@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 // Package api — regression tests for COMPAT-2 and CAST-2
 // (see review REVIEW-2026-09-22.md): core's null-source Stop and bare
 // CastingSubtitles body must not be silently treated as "status", and

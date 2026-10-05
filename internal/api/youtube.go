@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 // Package api — GET /yt/:id and GET /yt/:id.json
 //
 // Shells out to the system yt-dlp binary to resolve YouTube video formats.
@@ -14,15 +18,53 @@
 package api
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
+
+const (
+	ytTimeout   = 30 * time.Second
+	ytMaxOutput = 8 << 20
+)
+
+// ytSem caps concurrent yt-dlp processes.
+var ytSem = make(chan struct{}, 2)
+
+var errYTOutputTooLarge = errors.New("yt-dlp output exceeds limit")
+
+// limitWriter errors once more than n bytes have been written, unless
+// truncate is set, in which case excess bytes are silently dropped.
+type limitWriter struct {
+	w        io.Writer
+	n        int
+	truncate bool
+}
+
+func (l *limitWriter) Write(p []byte) (int, error) {
+	if len(p) > l.n {
+		if !l.truncate {
+			return 0, errYTOutputTooLarge
+		}
+		keep := l.n
+		l.n = 0
+		if keep > 0 {
+			_, _ = l.w.Write(p[:keep])
+		}
+		return len(p), nil
+	}
+	l.n -= len(p)
+	return l.w.Write(p)
+}
 
 // ytIDRe matches valid YouTube video IDs: 1-20 URL-safe characters.
 // Full URLs are rejected to prevent SSRF via yt-dlp.
@@ -84,18 +126,34 @@ func (s *server) handleYT(w http.ResponseWriter, r *http.Request, seg1 string) {
 	}
 
 	// -j: dump JSON info without downloading; --no-warnings: quieter stderr.
-	cmd := exec.CommandContext(r.Context(), ytPath, "-j", "--no-warnings", videoURL)
-	out, err := cmd.Output()
-	if err != nil {
-		// Exit code + stderr from yt-dlp
+	select {
+	case ytSem <- struct{}{}:
+		defer func() { <-ytSem }()
+	case <-r.Context().Done():
+		http.Error(w, "request cancelled", http.StatusServiceUnavailable)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), ytTimeout)
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, ytPath, "-j", "--no-warnings", videoURL)
+	cmd.Stdout = &limitWriter{w: &stdout, n: ytMaxOutput}
+	cmd.Stderr = &limitWriter{w: &stderr, n: 4096, truncate: true}
+	if err := cmd.Run(); err != nil {
 		msg := fmt.Sprintf("yt-dlp error: %v", err)
-		var ee *exec.ExitError
-		if errors.As(err, &ee) && len(ee.Stderr) > 0 {
-			msg = fmt.Sprintf("yt-dlp: %s", strings.TrimSpace(string(ee.Stderr)))
+		switch {
+		case errors.Is(ctx.Err(), context.DeadlineExceeded):
+			msg = "yt-dlp timed out"
+		case errors.Is(err, errYTOutputTooLarge):
+			msg = "yt-dlp output too large"
+		case stderr.Len() > 0:
+			msg = fmt.Sprintf("yt-dlp: %s", strings.TrimSpace(stderr.String()))
 		}
 		http.Error(w, msg, http.StatusBadGateway)
 		return
 	}
+	out := stdout.Bytes()
 
 	var info ytInfo
 	if err := json.Unmarshal(out, &info); err != nil {

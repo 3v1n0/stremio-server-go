@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+
+SPDX-License-Identifier: MIT
+-->
+
 # Torznab Add-on
 
 The `/torznab` add-on queries any [Torznab](https://torznab.github.io/spec-1.3-draft/)-compatible

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 // Package api integration and unit tests.
 // Runs in the same package so unexported helpers are directly callable.
 package api

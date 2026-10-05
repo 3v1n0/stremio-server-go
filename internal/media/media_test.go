@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 package media
 
 // Tests for pure and offline-testable helpers in internal/media.
@@ -52,13 +56,20 @@ func newTestHLSManager(t *testing.T) *hlsManager {
 // public API — including the SSRF pre-flight — against a real local server.
 func stubOpenSubClientTransport(t *testing.T, ts *httptest.Server) string {
 	t.Helper()
-	orig := openSubClient.Transport
-	openSubClient.Transport = &http.Transport{
-		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, network, ts.Listener.Addr().String())
-		},
+	stub := func() *http.Transport {
+		return &http.Transport{
+			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, network, ts.Listener.Addr().String())
+			},
+		}
 	}
-	t.Cleanup(func() { openSubClient.Transport = orig })
+	orig, origSelf := openSubClient.Transport, openSubSelfClient.Transport
+	openSubClient.Transport = stub()
+	openSubSelfClient.Transport = stub()
+	t.Cleanup(func() {
+		openSubClient.Transport = orig
+		openSubSelfClient.Transport = origSelf
+	})
 	return "http://93.184.216.34"
 }
 
@@ -201,6 +212,29 @@ func TestHLSSessionWritePlaylist(t *testing.T) {
 	s2 := &hlsSession{dir: dir, duration: 0, segLocks: map[string]*sync.Mutex{}}
 	if err := s2.writePlaylist(filepath.Join(dir, "bad.m3u8"), ""); err == nil {
 		t.Error("writePlaylist with duration=0 should return an error")
+	}
+}
+
+// playlist.m3u8 and video.m3u8 share segPrefix "" but are distinct files; both
+// must be written regardless of request order.
+func TestHLSSessionWritePlaylistSharedPrefix(t *testing.T) {
+	dir := t.TempDir()
+	s := &hlsSession{dir: dir, duration: 10.0, segLocks: map[string]*sync.Mutex{}}
+	for _, name := range []string{"playlist.m3u8", "video.m3u8"} {
+		p := filepath.Join(dir, name)
+		if err := s.writePlaylist(p, ""); err != nil {
+			t.Fatalf("writePlaylist(%s): %v", name, err)
+		}
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatalf("%s not written: %v", name, err)
+		}
+		if !strings.Contains(string(raw), "seg2.ts") {
+			t.Errorf("%s content wrong:\n%s", name, raw)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "video.m3u8.tmp")); err == nil {
+		t.Error("temp file left behind")
 	}
 }
 

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 // Package api — additional handler integration tests and helper unit tests
 // to push coverage well above 70%.
 package api

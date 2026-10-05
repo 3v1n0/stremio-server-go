@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 package app
 
 import (
@@ -11,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	_ "net/http/pprof" //nolint:gosec // G108: pprof is opt-in via STREMIO_PPROF, on its own listener, never the main handler
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -70,6 +75,8 @@ func safeGo(component string, fn func()) {
 // Stop-then-Start-again contract. logw receives the process log output; nil
 // defaults to os.Stderr.
 func Run(ctx context.Context, cfg Config, logw io.Writer) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	logging.Setup(logw)
 	if earlyenv.Applied {
 		logging.For("engine").Info("32-bit build: using classic file I/O for torrent storage (mmap cannot map files of 4 GiB or more)")
@@ -165,7 +172,7 @@ func Run(ctx context.Context, cfg Config, logw io.Writer) error {
 		logging.For("engine").Info("bittorrent encryption disabled")
 	}
 	if tcfg.BTProxy != "" {
-		logging.For("engine").Info("bittorrent proxy configured (trackers/webseeds/metainfo only; peers direct)", "proxy", tcfg.BTProxy)
+		logging.For("engine").Info("bittorrent proxy configured (trackers/webseeds/metainfo only; peers direct)", "proxy", redactProxyURL(tcfg.BTProxy))
 	}
 	if tcfg.DHTBootstrap != "" {
 		logging.For("engine").Info("extra dht bootstrap nodes configured", "nodes", tcfg.DHTBootstrap)
@@ -356,7 +363,7 @@ func Run(ctx context.Context, cfg Config, logw io.Writer) error {
 	// binds are unaffected — loopback is already reachable either way.
 	loopbackNeeded := !wildcardBind && !isLoopbackAddr(net.JoinHostPort(bindAddr, "0"))
 	var loopbackLn net.Listener
-	selfHost := "127.0.0.1"
+	selfHost := selfHostFor(bindAddr)
 	if loopbackNeeded {
 		loopbackAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(tcfg.HTTPPort))
 		ln, lerr := net.Listen("tcp", loopbackAddr)
@@ -519,9 +526,7 @@ func Run(ctx context.Context, cfg Config, logw io.Writer) error {
 		// ctx is already cancelled here; drain on a detached deadline.
 		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
-		if err := s.Shutdown(sctx); err != nil {
-			logging.For(name).Error("shutdown error", "err", err)
-		}
+		shutdownServer(sctx, s, name)
 	}
 	shutWg.Add(1)
 	go shutOne(srv, "http")
@@ -551,17 +556,45 @@ func proxySecret(appPath string, lookup Lookup) (string, error) {
 	}
 	secretFile := filepath.Join(appPath, "proxy-secret")
 	if data, err := os.ReadFile(secretFile); err == nil {
-		return strings.TrimSpace(string(data)), nil
+		if s := strings.TrimSpace(string(data)); s != "" {
+			return s, nil
+		}
 	}
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
 		return "", fmt.Errorf("failed to generate proxy secret: %w", err)
 	}
 	secret := hex.EncodeToString(buf)
-	if err := os.WriteFile(secretFile, []byte(secret), 0o600); err != nil {
+	tmp := secretFile + ".tmp"
+	if err := os.WriteFile(tmp, []byte(secret), 0o600); err != nil {
+		logging.For("proxy").Warn("failed to persist secret", "path", secretFile, "err", err)
+	} else if err := os.Rename(tmp, secretFile); err != nil {
+		_ = os.Remove(tmp)
 		logging.For("proxy").Warn("failed to persist secret", "path", secretFile, "err", err)
 	}
 	return secret, nil
+}
+
+// selfHostFor returns the host ffmpeg/ffprobe self-requests should use: the
+// bind address itself for a non-wildcard loopback bind (e.g. ::1, 127.0.0.2),
+// otherwise 127.0.0.1.
+func selfHostFor(bindAddr string) string {
+	if !isWildcardBindHost(bindAddr) && isLoopbackAddr(net.JoinHostPort(bindAddr, "0")) {
+		return bindAddr
+	}
+	return "127.0.0.1"
+}
+
+// redactProxyURL masks any userinfo password in a proxy URL for logging.
+func redactProxyURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.User == nil {
+		if err != nil {
+			return "<unparseable>"
+		}
+		return raw
+	}
+	return u.Redacted()
 }
 
 // isWildcardBindHost reports whether host (a BIND_ADDRESS value — the host
@@ -667,5 +700,18 @@ func hlsConfig(lookup Lookup) media.HLSConfig {
 		ProbeTimeout:    envDuration(lookup, "STREMIO_HLS_PROBE_TIMEOUT", d.ProbeTimeout),
 
 		SeekPreroll: seekPreroll(lookup, d.SeekPreroll),
+	}
+}
+
+// shutdownServer gracefully drains s until ctx expires, then force-closes any
+// lingering connections so a stuck stream cannot outlive the shutdown window.
+func shutdownServer(ctx context.Context, s *http.Server, name string) {
+	err := s.Shutdown(ctx)
+	if err == nil {
+		return
+	}
+	logging.For(name).Error("shutdown error", "err", err)
+	if errors.Is(err, context.DeadlineExceeded) {
+		_ = s.Close()
 	}
 }
