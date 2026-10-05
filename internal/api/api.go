@@ -291,6 +291,71 @@ func setActiveContentGuards(h http.Header) {
 	h["Content-Security-Policy"] = streamCSPSandbox
 }
 
+// sensitiveQueryKeys are query parameters whose values must never reach the
+// access log: lz carries reversible lz-string payloads holding URLs with
+// embedded ftp/nntp/http credentials; the rest are common secret-bearing names.
+var sensitiveQueryKeys = map[string]struct{}{
+	"lz": {}, "apikey": {}, "api_key": {}, "authkey": {}, "token": {},
+	"access_token": {}, "password": {}, "pass": {}, "key": {}, "auth": {},
+}
+
+// userinfoRe matches the userinfo of a URL embedded in a request URI, either
+// literal ("://user:pass@") or percent-encoded ("%3A%2F%2Fuser%3Apass%40").
+var userinfoRe = regexp.MustCompile(`(?i)(://|%3A%2F%2F)[^/?&#\s]*?(?:@|%40)`)
+
+// redactRequestURI returns u.RequestURI() with sensitive query values and any
+// embedded URL credentials replaced by "REDACTED", for the HTTP access log.
+func redactRequestURI(u *url.URL) string {
+	uri := u.RequestURI()
+	if i := strings.IndexByte(uri, '?'); i >= 0 && i+1 < len(uri) {
+		pairs := strings.Split(uri[i+1:], "&")
+		for j, p := range pairs {
+			k, _, found := strings.Cut(p, "=")
+			if !found {
+				continue
+			}
+			name, err := url.QueryUnescape(k)
+			if err != nil {
+				name = k
+			}
+			if _, ok := sensitiveQueryKeys[strings.ToLower(name)]; ok {
+				pairs[j] = k + "=REDACTED"
+			}
+		}
+		uri = uri[:i+1] + strings.Join(pairs, "&")
+	}
+	return userinfoRe.ReplaceAllString(uri, "${1}REDACTED@")
+}
+
+// filterRequestTrackers drops request-supplied tracker URLs whose host is
+// localhost or a literal loopback, unspecified, link-local or cloud-metadata
+// IP, so a request cannot make the torrent client announce to local services
+// (blind SSRF). Public and LAN trackers pass through unchanged.
+func filterRequestTrackers(in []string) []string {
+	if len(in) == 0 {
+		return in
+	}
+	out := make([]string, 0, len(in))
+	for _, tr := range in {
+		u, err := url.Parse(strings.TrimSpace(tr))
+		if err != nil || u.Hostname() == "" {
+			continue
+		}
+		host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+		if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+			continue
+		}
+		if ip := net.ParseIP(host); ip != nil {
+			if ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() ||
+				ip.IsLinkLocalMulticast() || netguard.IsCloudMetadata(ip) {
+				continue
+			}
+		}
+		out = append(out, tr)
+	}
+	return out
+}
+
 // ServeHTTP enforces the Origin allowlist (SEC-1 / Contract 2), applies CORS,
 // handles preflight, and dispatches to the router. A disallowed Origin is
 // rejected with 403 before any routing — including the OPTIONS preflight —
@@ -329,7 +394,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.route(rec, r)
 		s.accessLog.Info("request",
 			"method", r.Method,
-			"uri", r.URL.RequestURI(),
+			"uri", redactRequestURI(r.URL),
 			"status", rec.StatusOrOK(),
 			"duration_ms", time.Since(start).Milliseconds(),
 			"bytes", rec.Bytes,
@@ -662,7 +727,7 @@ func (s *server) handleStream(w http.ResponseWriter, r *http.Request, ih, idxSeg
 	trackers := q["tr"]
 	mustInc := compileMustInclude(q["f"])
 
-	eng, err := s.em.EnsureEngine(ih, types.AddOptions{Trackers: trackers})
+	eng, err := s.em.EnsureEngine(ih, types.AddOptions{Trackers: filterRequestTrackers(trackers)})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -924,6 +989,7 @@ func (s *server) handleCreate(w http.ResponseWriter, r *http.Request, ih string)
 	opts := types.AddOptions{Torrent: body.Torrent}
 	opts.Trackers = append(opts.Trackers, trackersFromSources(peerSearchSources(&body))...)
 	opts.Trackers = append(opts.Trackers, announceFromTorrent(body.Torrent)...)
+	opts.Trackers = filterRequestTrackers(opts.Trackers)
 
 	eng, err := s.em.EnsureEngine(ih, opts)
 	if err != nil {
@@ -1122,6 +1188,7 @@ func (s *server) handlePeers(w http.ResponseWriter, r *http.Request, ih string) 
 func (s *server) handleStreamSubtitles(w http.ResponseWriter, r *http.Request, ih string, idx int) {
 	// Build the local HTTP URL that the subtitle prober will pull from.
 	streamURL := fmt.Sprintf("http://127.0.0.1:%d/%s/%d", s.cfg.HTTPPort, ih, idx)
+	setActiveContentGuards(w.Header())
 	w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
 	// best-effort: WriteSubtitles may fail if the file isn't a subtitle stream
 	_ = s.prober.WriteSubtitles(w, streamURL, "vtt", 0)
@@ -1477,6 +1544,7 @@ func (s *server) handleHLS(w http.ResponseWriter, r *http.Request, seg []string)
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
+	setActiveContentGuards(w.Header())
 	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Cache-Control", "no-cache")
 	http.ServeFile(w, r, path)
@@ -1569,6 +1637,7 @@ func (s *server) handleSubtitles(w http.ResponseWriter, r *http.Request, ext str
 	if o := q.Get("offset"); o != "" {
 		offset, _ = strconv.Atoi(o)
 	}
+	setActiveContentGuards(w.Header())
 	if ext == "vtt" {
 		w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
 	} else {

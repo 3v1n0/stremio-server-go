@@ -14,6 +14,7 @@ package api
 
 import (
 	"bytes"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
@@ -25,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -52,10 +54,17 @@ func perr(status int, format string, a ...any) *provisionError {
 	return &provisionError{status: status, msg: fmt.Sprintf(format, a...)}
 }
 
+// provisionMu serializes ProvisionCert so the /get-https handler and the
+// background renewer cannot race on the shared .bak paths in installCertFiles.
+var provisionMu sync.Mutex
+
 // ProvisionCert requests a TLS certificate for ipAddress from api.strem.io using
 // authKey, atomically installs https-cert.pem/https-key.pem under appPath, and
 // returns the issued domain and expiry.
 func ProvisionCert(appPath, authKey, ipAddress string) (*ProvisionResult, error) {
+	provisionMu.Lock()
+	defer provisionMu.Unlock()
+
 	if ipAddress == "" {
 		return nil, perr(http.StatusBadRequest, "missing ipAddress")
 	}
@@ -103,7 +112,7 @@ func ProvisionCert(appPath, authKey, ipAddress string) (*ProvisionResult, error)
 		return nil, perr(http.StatusNotFound, "certificate or privateKey missing in API response")
 	}
 
-	if err := installCertFiles(appPath, certPEM, keyPEM); err != nil {
+	if err := installValidatedCert(appPath, certPEM, keyPEM); err != nil {
 		return nil, err
 	}
 
@@ -112,6 +121,16 @@ func ProvisionCert(appPath, authKey, ipAddress string) (*ProvisionResult, error)
 		res.NotAfter = leaf.NotAfter
 	}
 	return res, nil
+}
+
+// installValidatedCert refuses to touch the on-disk cert/key unless the pair
+// parses and the key matches the leaf certificate, so a malformed or
+// mismatched API response can never replace a working installation.
+func installValidatedCert(appPath, certPEM, keyPEM string) error {
+	if _, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM)); err != nil {
+		return perr(http.StatusBadGateway, "API returned invalid certificate/key pair: %v", err)
+	}
+	return installCertFiles(appPath, certPEM, keyPEM)
 }
 
 // parseCertResult extracts cert PEM, key PEM, and common name from the

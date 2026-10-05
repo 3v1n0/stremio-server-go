@@ -41,11 +41,13 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/huin/goupnp"
@@ -53,7 +55,100 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/M0Rf30/stremio-server-go/internal/logging"
+	"github.com/M0Rf30/stremio-server-go/internal/netguard"
 )
+
+// upnpMaxBody caps any single UPnP description/SOAP response body.
+const upnpMaxBody = 1 << 20
+
+// upnpHTTPClient is the only HTTP client used for UPnP description fetches and
+// SOAP control. SSDP Location and control URLs are attacker-influenced, so the
+// dialer admits only LAN addresses (private/link-local, never loopback,
+// unspecified or cloud-metadata), no proxies and no redirects, and response
+// bodies are size-bounded.
+var upnpHTTPClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &limitedBodyTransport{
+		rt: &http.Transport{
+			Proxy: nil,
+			DialContext: (&net.Dialer{
+				Timeout: 3 * time.Second,
+				Control: upnpDialControl,
+			}).DialContext,
+			ResponseHeaderTimeout: 5 * time.Second,
+			DisableKeepAlives:     true,
+		},
+		max: upnpMaxBody,
+	},
+	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+}
+
+func init() {
+	// goupnp fetches device descriptions with this package-level client.
+	goupnp.HTTPClientDefault = upnpHTTPClient
+}
+
+// validateUPnPIP reports whether ip is an acceptable UPnP peer: a LAN
+// (private or link-local) unicast address that is not loopback, unspecified
+// or the cloud-metadata address.
+func validateUPnPIP(ip net.IP) error {
+	switch {
+	case ip == nil:
+		return fmt.Errorf("upnp: not an IP address")
+	case ip.IsLoopback() || ip.IsUnspecified() || ip.IsMulticast():
+		return fmt.Errorf("upnp: blocked address %s", ip)
+	case netguard.IsCloudMetadata(ip):
+		return fmt.Errorf("upnp: blocked cloud-metadata address %s", ip)
+	case !netguard.IsPrivate(ip) && !ip.IsLinkLocalUnicast():
+		return fmt.Errorf("upnp: non-LAN address %s", ip)
+	}
+	return nil
+}
+
+// upnpDialControl validates the resolved IP at connect time (rebinding-safe).
+func upnpDialControl(_, address string, _ syscall.RawConn) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("upnp: cannot parse dial address %q: %w", address, err)
+	}
+	return validateUPnPIP(net.ParseIP(host))
+}
+
+// upnpLocationOK accepts only http(s) Location URLs with a host.
+func upnpLocationOK(u *url.URL) bool {
+	return u != nil && (u.Scheme == "http" || u.Scheme == "https") && u.Hostname() != ""
+}
+
+// upnpSameHost reports whether b has the same hostname as a (port may differ,
+// devices commonly serve control on another port) and is http(s).
+func upnpSameHost(a, b *url.URL) bool {
+	if a == nil || b == nil || (b.Scheme != "http" && b.Scheme != "https") {
+		return false
+	}
+	return strings.EqualFold(a.Hostname(), b.Hostname())
+}
+
+// limitedBodyTransport caps response bodies at max bytes.
+type limitedBodyTransport struct {
+	rt  http.RoundTripper
+	max int64
+}
+
+func (t *limitedBodyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.rt.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.ContentLength > t.max {
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("upnp: response body too large (%d bytes)", resp.ContentLength)
+	}
+	resp.Body = struct {
+		io.Reader
+		io.Closer
+	}{io.LimitReader(resp.Body, t.max), resp.Body}
+	return resp, nil
+}
 
 // CastingDevice is one UPnP MediaRenderer discovered on the LAN.
 type CastingDevice struct {
@@ -592,6 +687,14 @@ func discoverDevices() ([]CastingDevice, map[string]*av1.AVTransport1) {
 			// Device is a MediaRenderer but lacks AVTransport:1; skip.
 			continue
 		}
+		// The SOAP control URL comes from the (untrusted) description XML.
+		// Require it to stay on the host that answered SSDP and route all
+		// control traffic through the LAN-only client.
+		if !upnpLocationOK(mrd.Location) || !upnpSameHost(mrd.Location, &avClients[0].SOAPClient.EndpointURL) {
+			logging.For("casting").Warn("ignoring UPnP device with off-host control URL", "location", mrd.Location.Redacted())
+			continue
+		}
+		avClients[0].SOAPClient.HTTPClient = *upnpHTTPClient
 
 		d := &mrd.Root.Device
 		id := mrd.USN
