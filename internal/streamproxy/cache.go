@@ -171,6 +171,33 @@ func cacheKey(rawurl string, hdr http.Header) string {
 	return hex.EncodeToString(buf[:])
 }
 
+// cacheableResponse reports whether resp may be buffered into the segment
+// cache: a 200 with a known Content-Length no larger than maxSegmentBytes.
+// Anything else must be streamed to avoid unbounded buffering.
+func cacheableResponse(resp *http.Response) bool {
+	return resp.StatusCode == http.StatusOK &&
+		resp.ContentLength >= 0 && resp.ContentLength <= maxSegmentBytes
+}
+
+// cacheLookup returns a cached response for (rawurl, hdr), if present.
+func (h *Handler) cacheLookup(rawurl string, hdr http.Header) ([]byte, http.Header, int, bool) {
+	if h.cache == nil {
+		return nil, nil, 0, false
+	}
+	entry := h.cache.getFull(cacheKey(rawurl, hdr))
+	if entry == nil {
+		return nil, nil, 0, false
+	}
+	if entry.hdr != nil {
+		// F6: return stored clone directly; callers only read the map.
+		return entry.val, entry.hdr, entry.status, true
+	}
+	// hdr was nil at store time — synthesise a minimal Content-Length header.
+	outHdr := make(http.Header)
+	outHdr.Set("Content-Length", strconv.Itoa(len(entry.val)))
+	return entry.val, outHdr, entry.status, true
+}
+
 // cachedFetch fetches rawurl, using the segment cache when configured.
 // Returns body, response headers, HTTP status, and any error.
 func (h *Handler) cachedFetch(ctx context.Context, rawurl string, hdr http.Header, proxyURL string) ([]byte, http.Header, int, error) {
@@ -193,16 +220,8 @@ func (h *Handler) cachedFetch(ctx context.Context, rawurl string, hdr http.Heade
 	}
 
 	// Cache hit.
-	if entry := h.cache.getFull(cacheKey(rawurl, hdr)); entry != nil {
-		if entry.hdr != nil {
-			// F6: return stored clone directly; callers (copyAllowedHeaders,
-			// applyRespHeaders) only read the map — no defensive copy needed.
-			return entry.val, entry.hdr, entry.status, nil
-		}
-		// hdr was nil at store time — synthesise a minimal Content-Length header.
-		outHdr := make(http.Header)
-		outHdr.Set("Content-Length", strconv.Itoa(len(entry.val)))
-		return entry.val, outHdr, entry.status, nil
+	if data, respHdr, status, ok := h.cacheLookup(rawurl, hdr); ok {
+		return data, respHdr, status, nil
 	}
 
 	// Cache miss — fetch, store, return.

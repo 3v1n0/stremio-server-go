@@ -110,7 +110,7 @@ func TestDashRewriteSegmentTemplateURLShape(t *testing.T) {
 	// The plain (non-base64) encoding means the d= value starts with
 	// "https%3A%2F%2F" (percent-encoded scheme) rather than a base64 blob.
 	// Confirm the proxy stream prefix is followed by the percent-encoded origin.
-	proxyPrefix := "https://ext.example/proxy/stream?d=https%3A%2F%2Forigin.example"
+	proxyPrefix := "https://ext.example/proxy/stream?d=https%3A%2F%2Fcdn.example"
 	if !strings.Contains(out, proxyPrefix) {
 		t.Errorf("SegmentTemplate proxy URL does not begin with plain-encoded origin; output:\n%s", out)
 	}
@@ -136,7 +136,7 @@ func TestDashRewriteSegmentURLBase64(t *testing.T) {
 	}
 
 	// The resolved absolute URL must appear base64url-encoded in d=.
-	abs := resolveURL(dest, "chunk1.m4s")
+	abs := resolveURL("https://cdn.example/dash/", "chunk1.m4s") // resolved against AdaptationSet BaseURL
 	encoded := base64.RawURLEncoding.EncodeToString([]byte(abs))
 	if !strings.Contains(out, "proxy/stream?d="+encoded) {
 		t.Errorf("SegmentURL media not base64-encoded (want d=%s); output:\n%s", encoded, out)
@@ -151,7 +151,7 @@ func TestDashRewriteSegmentURLIndexAttribute(t *testing.T) {
 	if strings.Contains(out, `index="idx2.sidx"`) {
 		t.Errorf("SegmentURL index attribute not rewritten; output:\n%s", out)
 	}
-	abs := resolveURL(dest, "idx2.sidx")
+	abs := resolveURL("https://cdn.example/dash/", "idx2.sidx")
 	encoded := base64.RawURLEncoding.EncodeToString([]byte(abs))
 	if !strings.Contains(out, "proxy/stream?d="+encoded) {
 		t.Errorf("SegmentURL index not base64-encoded (want d=%s); output:\n%s", encoded, out)
@@ -173,7 +173,7 @@ func TestDashRewriteInitializationSourceURL(t *testing.T) {
 	if !strings.Contains(out, `range="0-999"`) {
 		t.Errorf("Initialization range attribute was unexpectedly modified; output:\n%s", out)
 	}
-	abs := resolveURL(dest, "init.mp4")
+	abs := resolveURL("https://cdn.example/dash/", "init.mp4")
 	encoded := base64.RawURLEncoding.EncodeToString([]byte(abs))
 	if !strings.Contains(out, "proxy/stream?d="+encoded) {
 		t.Errorf("Initialization sourceURL not base64-encoded (want d=%s); output:\n%s", encoded, out)
@@ -300,7 +300,7 @@ func TestDashRewritePreservesNamespaces(t *testing.T) {
 	if !strings.Contains(out, "<BaseURL>"+esc.String()+"</BaseURL>") {
 		t.Errorf("BaseURL not rewritten as expected:\n%s", out)
 	}
-	wantInit := dashBuildTemplateURL(h, "https://ext.example", "https://origin.example/stream/init-$RepresentationID$.m4s", opts)
+	wantInit := dashBuildTemplateURL(h, "https://ext.example", "https://cdn.example/dash/init-$RepresentationID$.m4s", opts)
 	esc.Reset()
 	_ = xml.EscapeText(&esc, []byte(wantInit))
 	if !strings.Contains(out, `initialization="`+esc.String()+`"`) {

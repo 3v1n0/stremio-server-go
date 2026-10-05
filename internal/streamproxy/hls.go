@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -52,7 +53,13 @@ func hlsServe(h *Handler, w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "upstream fetch failed", http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
+	// Never rewrite an error page into a bogus playlist: surface upstream
+	// failures as a clean 502.
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		http.Error(w, "upstream returned status "+strconv.Itoa(resp.StatusCode), http.StatusBadGateway)
+		return
+	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxManifestBytes+1))
 	if err != nil {
 		http.Error(w, "reading upstream response failed", http.StatusBadGateway)
@@ -69,6 +76,7 @@ func hlsServe(h *Handler, w http.ResponseWriter, r *http.Request) {
 	}
 	rewritten := hlsRewrite(h, r, opts, playlist)
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	setProxySecurityHeaders(w)
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(rewritten))
 }
@@ -96,10 +104,16 @@ func hlsRewrite(h *Handler, r *http.Request, opts *Options, playlist string) str
 	nextIsVariant := false // true after #EXT-X-STREAM-INF until next URI line
 
 	for _, line := range lines {
-		if line == "" {
-			out = append(out, line)
+		// Tolerate CRLF playlists (and stray whitespace): classify and resolve
+		// on the trimmed line, matching hlsSegmentURLs, so prefetch cache keys
+		// equal the URLs the player will request. Blank lines are preserved
+		// as empty lines and never turned into proxy URLs.
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			out = append(out, "")
 			continue
 		}
+		line = trimmed
 
 		if !strings.HasPrefix(line, "#") {
 			// Bare URI line.

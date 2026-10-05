@@ -100,6 +100,24 @@ func (h *Handler) signToken(t token) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(ct), nil
 }
 
+// subToken mints a token for a rewritten sub-URL of a token-authorised
+// manifest request. It reuses the parent token's expiry and IP binding (so the
+// sub-URL never outlives the grant) and seals endpoint plus params so the
+// token cannot be replayed against another path or destination. Returns ""
+// when opts did not originate from a token-authorised request or signing fails.
+// params may be nil for URLs whose destination is not known up front (e.g.
+// DASH SegmentTemplate placeholders).
+func (h *Handler) subToken(opts *Options, endpoint string, params map[string]string) string {
+	if opts == nil || opts.subTokenExp == 0 || len(h.cfg.Secret) == 0 {
+		return ""
+	}
+	tok, err := h.signToken(token{Endpoint: endpoint, Params: params, Exp: opts.subTokenExp, IP: opts.subTokenIP})
+	if err != nil {
+		return ""
+	}
+	return tok
+}
+
 // verifyToken decodes and verifies a signed token string.
 // It checks expiry and, when t.IP is set, that client matches.
 func (h *Handler) verifyToken(s string, client net.IP) (token, error) {

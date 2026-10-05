@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -46,13 +47,18 @@ func dashServe(h *Handler, w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := h.fetch(r.Context(), http.MethodGet, opts.Dest, opts.ReqHeaders, nil, effProxy)
 	if err != nil {
-		http.Error(w, "upstream error: "+err.Error(), http.StatusBadGateway)
+		http.Error(w, "upstream error", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		// Do not rewrite an upstream error page into a bogus manifest.
+		http.Error(w, "upstream returned status "+strconv.Itoa(resp.StatusCode), http.StatusBadGateway)
+		return
+	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxManifestBytes+1))
 	if err != nil {
-		http.Error(w, "read error: "+err.Error(), http.StatusBadGateway)
+		http.Error(w, "read error", http.StatusBadGateway)
 		return
 	}
 	if len(body) > maxManifestBytes {
@@ -60,6 +66,7 @@ func dashServe(h *Handler, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := dashRewrite(h, r, opts, body)
+	setProxySecurityHeaders(w)
 	w.Header().Set("Content-Type", "application/dash+xml")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(out)
@@ -109,6 +116,11 @@ func dashBuildTemplateURL(h *Handler, ext, abs string, opts *Options) string {
 		if opts.APIPassword != "" {
 			b.WriteString("&api_password=")
 			b.WriteString(url.QueryEscape(opts.APIPassword))
+		} else if tok := h.subToken(opts, "/proxy/stream", nil); tok != "" {
+			// Token-authorised manifest: mint a path-bound sub-token. params
+			// are nil because d holds unexpanded $...$ placeholders.
+			b.WriteString("&token=")
+			b.WriteString(url.QueryEscape(tok))
 		}
 		if opts.Proxy != "" {
 			b.WriteString("&proxy=")
@@ -140,8 +152,12 @@ func dashBuildTemplateURL(h *Handler, ext, abs string, opts *Options) string {
 // If XML tokenisation fails at any point, or the element nesting is not
 // balanced, the original bytes are returned unchanged (best-effort; no panics).
 //
-// Limitation: nested BaseURL chains are each resolved against opts.Dest rather
-// than against each other's accumulated base.
+// Relative URLs are resolved per ISO/IEC 23009-1 §5.6: a BaseURL is resolved
+// against the BaseURL in effect for its parent element (MPD > Period >
+// AdaptationSet > Representation), starting from the MPD's own URL
+// (opts.Dest), and SegmentTemplate/SegmentURL/Initialization attributes are
+// resolved against the innermost base.  Only the first BaseURL of an element
+// is used as the base (the remainder are failover alternatives).
 func dashRewrite(h *Handler, r *http.Request, opts *Options, mpd []byte) []byte {
 	dec := xml.NewDecoder(bytes.NewReader(mpd))
 	var buf bytes.Buffer
@@ -149,6 +165,12 @@ func dashRewrite(h *Handler, r *http.Request, opts *Options, mpd []byte) []byte 
 	extBase := h.externalBase(r)
 	inBaseURL := false
 	var stack []string
+	// bases[i] is the absolute base URL in effect for the children of the
+	// element at stack[i]; baseSet[i] records whether that element's first
+	// BaseURL child has already been applied.
+	bases := []string{opts.Dest}
+	baseSet := []bool{false}
+	curBase := func() string { return bases[len(bases)-1] }
 	var prev int64
 
 	for {
@@ -166,6 +188,9 @@ func dashRewrite(h *Handler, r *http.Request, opts *Options, mpd []byte) []byte 
 		switch t := tok.(type) {
 		case xml.StartElement:
 			stack = append(stack, dashQName(t.Name))
+			// Children inherit the parent's base until their own BaseURL says otherwise.
+			bases = append(bases, curBase())
+			baseSet = append(baseSet, false)
 
 			changed := false
 			rewrite := func(i int, v string) {
@@ -180,7 +205,7 @@ func dashRewrite(h *Handler, r *http.Request, opts *Options, mpd []byte) []byte 
 				for i, attr := range t.Attr {
 					switch attr.Name.Local {
 					case "initialization", "media":
-						abs := resolveURL(opts.Dest, attr.Value)
+						abs := resolveURL(curBase(), attr.Value)
 						rewrite(i, dashBuildTemplateURL(h, extBase, abs, opts))
 					}
 				}
@@ -190,7 +215,7 @@ func dashRewrite(h *Handler, r *http.Request, opts *Options, mpd []byte) []byte 
 					switch attr.Name.Local {
 					case "media", "index":
 						if attr.Value != "" {
-							abs := resolveURL(opts.Dest, attr.Value)
+							abs := resolveURL(curBase(), attr.Value)
 							rewrite(i, h.buildProxyURL(extBase, "/proxy/stream", abs, opts))
 						}
 					}
@@ -199,7 +224,7 @@ func dashRewrite(h *Handler, r *http.Request, opts *Options, mpd []byte) []byte 
 			case "Initialization":
 				for i, attr := range t.Attr {
 					if attr.Name.Local == "sourceURL" {
-						abs := resolveURL(opts.Dest, attr.Value)
+						abs := resolveURL(curBase(), attr.Value)
 						rewrite(i, h.buildProxyURL(extBase, "/proxy/stream", abs, opts))
 					}
 				}
@@ -231,6 +256,8 @@ func dashRewrite(h *Handler, r *http.Request, opts *Options, mpd []byte) []byte 
 				return mpd
 			}
 			stack = stack[:len(stack)-1]
+			bases = bases[:len(bases)-1]
+			baseSet = baseSet[:len(baseSet)-1]
 			// The synthetic end of a self-closing tag consumes no input
 			// (raw is empty); the start tag already carried the "/>".
 			buf.Write(raw)
@@ -239,7 +266,15 @@ func dashRewrite(h *Handler, r *http.Request, opts *Options, mpd []byte) []byte 
 			if inBaseURL {
 				trimmed := strings.TrimSpace(string(t))
 				if trimmed != "" {
-					abs := resolveURL(opts.Dest, trimmed)
+					// The BaseURL element's own frame is the last entry; its
+					// parent's frame (the one whose base it defines) is just below.
+					pi := len(bases) - 2
+					parent := bases[pi]
+					abs := resolveURL(parent, trimmed)
+					if !baseSet[pi] {
+						bases[pi] = abs
+						baseSet[pi] = true
+					}
 					proxied := h.buildProxyURL(extBase, "/proxy/stream", abs, opts)
 					inBaseURL = false // consumed; EndElement handles the empty-content case
 					if err := xml.EscapeText(&buf, []byte(proxied)); err != nil {

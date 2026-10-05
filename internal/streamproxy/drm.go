@@ -168,6 +168,7 @@ func drmDecryptCENC(method string, key, iv []byte, segment []byte) ([]byte, erro
 	if err != nil {
 		return nil, fmt.Errorf("CENC: box parse: %w", err)
 	}
+	tenc := drmFindTenc(boxes)
 
 	// Collect moof boxes; each moof is paired with the immediately-following mdat.
 	for i, box := range boxes {
@@ -189,7 +190,7 @@ func drmDecryptCENC(method string, key, iv []byte, segment []byte) ([]byte, erro
 		mdatBodyStart := mdat.Start + mdat.HdrSize
 		mdatData := out[mdatBodyStart : mdat.Start+mdat.Size]
 
-		if err := drmDecryptMoof(method, key, iv, box, mdatData, mdatBodyStart); err != nil {
+		if err := drmDecryptMoof(method, key, iv, tenc, box, mdatData, mdatBodyStart); err != nil {
 			return nil, err
 		}
 	}
@@ -198,7 +199,7 @@ func drmDecryptCENC(method string, key, iv []byte, segment []byte) ([]byte, erro
 
 // drmDecryptMoof decrypts all samples in one moof box's traf children.
 // mdatBodyStart is the absolute byte offset of the first mdat data byte in the segment.
-func drmDecryptMoof(method string, key, iv []byte, moof drmBox, mdatData []byte, mdatBodyStart int) error {
+func drmDecryptMoof(method string, key, iv []byte, tenc drmTenc, moof drmBox, mdatData []byte, mdatBodyStart int) error {
 	children, err := drmParseBoxes(moof.Payload)
 	if err != nil {
 		return fmt.Errorf("CENC: moof children: %w", err)
@@ -214,7 +215,7 @@ func drmDecryptMoof(method string, key, iv []byte, moof drmBox, mdatData []byte,
 		if err != nil {
 			return fmt.Errorf("CENC: traf children: %w", err)
 		}
-		if err := drmDecryptTraf(method, key, iv, trafBoxes, moofBase, mdatData, mdatBodyStart); err != nil {
+		if err := drmDecryptTraf(method, key, iv, tenc, trafBoxes, moofBase, mdatData, mdatBodyStart); err != nil {
 			return err
 		}
 	}
@@ -247,7 +248,122 @@ type drmSencEntry struct {
 	Subsamples []drmSubsample
 }
 
-func drmDecryptTraf(method string, key, iv []byte, trafBoxes []drmBox, moofStart int, mdatData []byte, mdatBodyStart int) error {
+// Default cbcs pattern (ISO/IEC 23001-7 §10.4 / CMAF) used for video when the
+// segment carries no tenc box: encrypt 1 block, skip 9.
+const (
+	drmDefaultCryptBlocks = 1
+	drmDefaultSkipBlocks  = 9
+)
+
+// drmTenc holds the fields of a Track Encryption Box (tenc) that influence
+// decryption.  found is false when the segment carried no tenc (media
+// segments usually omit moov), in which case all accessors return neutral
+// "unknown" values.
+type drmTenc struct {
+	found           bool
+	hasPattern      bool // tenc version >= 1: crypt/skip byte blocks are present
+	crypt, skip     int
+	perSampleIVSize int
+	constIV         []byte
+}
+
+// ivFallback returns the IV to use for samples that carry no per-sample IV:
+// the tenc default constant IV when present, otherwise the caller-supplied iv.
+func (t drmTenc) ivFallback(iv []byte) []byte {
+	if t.found && len(t.constIV) > 0 {
+		return t.constIV
+	}
+	return iv
+}
+
+// ivSizeHint returns the tenc default_Per_Sample_IV_Size, or -1 if unknown.
+func (t drmTenc) ivSizeHint() int {
+	if !t.found {
+		return -1
+	}
+	return t.perSampleIVSize
+}
+
+// pattern returns the cbcs crypt/skip byte-block pattern for a sample.  The
+// tenc values win when present.  Without a tenc, samples with subsample
+// tables (video) use the 1:9 default; whole-sample-encrypted data (audio)
+// has no pattern (crypt=skip=0 means every full block is encrypted).
+func (t drmTenc) pattern(hasSubsamples bool) (crypt, skip int) {
+	if t.found && t.hasPattern {
+		return t.crypt, t.skip
+	}
+	if hasSubsamples {
+		return drmDefaultCryptBlocks, drmDefaultSkipBlocks
+	}
+	return 0, 0
+}
+
+// drmParseTenc parses a tenc box payload (version/flags included).
+func drmParseTenc(p []byte) (drmTenc, error) {
+	// version(1) flags(3) reserved(1) pattern/reserved(1) isProtected(1)
+	// perSampleIVSize(1) KID(16) [constIVSize(1) constIV(n)]
+	if len(p) < 24 {
+		return drmTenc{}, errors.New("tenc too short")
+	}
+	t := drmTenc{found: true}
+	if p[0] >= 1 {
+		t.hasPattern = true
+		t.crypt = int(p[5] >> 4)
+		t.skip = int(p[5] & 0x0f)
+	}
+	isProtected := p[6]
+	t.perSampleIVSize = int(p[7])
+	if isProtected == 1 && t.perSampleIVSize == 0 {
+		if len(p) < 25 {
+			return drmTenc{}, errors.New("tenc: missing constant IV size")
+		}
+		n := int(p[24])
+		if n != 8 && n != 16 || len(p) < 25+n {
+			return drmTenc{}, fmt.Errorf("tenc: invalid constant IV size %d", n)
+		}
+		t.constIV = append([]byte(nil), p[25:25+n]...)
+	}
+	return t, nil
+}
+
+// drmFindTenc locates the first tenc box inside the sample descriptions
+// (stsd → encv/enca → sinf → schi → tenc) of any moov found in boxes.  It
+// returns a zero drmTenc (found == false) when none is present or parseable.
+func drmFindTenc(boxes []drmBox) drmTenc {
+	for _, b := range boxes {
+		if b.Type != "stsd" {
+			continue
+		}
+		pl := b.Payload
+		// Sample entries have a fixed-size prefix whose length depends on the
+		// handler, so locate the sinf box by its type tag and validate that it
+		// begins with a frma child.
+		for i := 4; i+4 <= len(pl); i++ {
+			if string(pl[i:i+4]) != "sinf" {
+				continue
+			}
+			start := i - 4
+			size := int(binary.BigEndian.Uint32(pl[start:]))
+			if size < 8+8 || start+size > len(pl) || string(pl[start+12:start+16]) != "frma" {
+				continue
+			}
+			children, err := drmParseBoxes(pl[start+8 : start+size])
+			if err != nil {
+				continue
+			}
+			for _, c := range children {
+				if c.Type == "tenc" {
+					if t, err := drmParseTenc(c.Payload); err == nil {
+						return t
+					}
+				}
+			}
+		}
+	}
+	return drmTenc{}
+}
+
+func drmDecryptTraf(method string, key, iv []byte, tenc drmTenc, trafBoxes []drmBox, moofStart int, mdatData []byte, mdatBodyStart int) error {
 	var tfhd drmTfhd
 	var samples []drmTrunSample
 	var sencEntries []drmSencEntry
@@ -278,7 +394,7 @@ func drmDecryptTraf(method string, key, iv []byte, trafBoxes []drmBox, moofStart
 
 		case "senc":
 			var err error
-			sencEntries, err = drmParseSenc(b.Payload, iv)
+			sencEntries, err = drmParseSenc(b.Payload, tenc.ivFallback(iv), tenc.ivSizeHint())
 			if err != nil {
 				return fmt.Errorf("CENC: senc: %w", err)
 			}
@@ -335,11 +451,15 @@ func drmDecryptTraf(method string, key, iv []byte, trafBoxes []drmBox, moofStart
 		}
 
 		entry := sencEntries[i]
+		if len(entry.IV) == 0 {
+			return fmt.Errorf("CENC: sample %d has no IV (per-sample IV size 0 and no constant IV available)", i)
+		}
 		sampData := mdatData[pos : pos+size]
 
 		var decErr error
 		if method == "CBCS" {
-			decErr = drmDecryptCBCSubsamples(key, entry.IV, sampData, entry.Subsamples)
+			crypt, skip := tenc.pattern(len(entry.Subsamples) > 0)
+			decErr = drmDecryptCBCSubsamples(key, entry.IV, sampData, entry.Subsamples, crypt, skip)
 		} else {
 			// AES-CTR: decrypt in place; drmDecryptCTRSubsamples XORs sampData directly.
 			_, decErr = drmDecryptCTRSubsamples(key, entry.IV, sampData, entry.Subsamples)
@@ -525,18 +645,20 @@ func drmParseTrun(p []byte) ([]drmTrunSample, int32, error) {
 }
 
 // drmParseSenc parses the Sample Encryption box payload.
-// fallbackIV is used when the box does not contain per-sample IVs (IV size 0).
+// fallbackIV is used when the box does not contain per-sample IVs (IV size 0,
+// i.e. a constant IV taken from the tenc box or supplied by the caller).
 //
 // The ISO BMFF senc box does not encode the per-sample IV size; that value is
-// carried by the Track Encryption Box (tenc) in the moov hierarchy, which is
-// not available at this call site.  We resolve the ambiguity structurally: we
-// try both IV sizes (8 and 16) and require that exactly one fully consumes the
-// box payload.  When both sizes would consume all bytes (only possible when
-// sampleCount is zero) we treat the result as unambiguously empty and return
-// it directly.  If neither parses successfully, or both parse and leave no
-// leftover bytes for a non-zero sample count, we return an error instead of
-// silently guessing.
-func drmParseSenc(p []byte, fallbackIV []byte) ([]drmSencEntry, error) {
+// carried by the Track Encryption Box (tenc) in the moov hierarchy.  When the
+// segment carried a tenc, ivSizeHint holds its default_Per_Sample_IV_Size and
+// is tried first; pass -1 when it is unknown.  Otherwise (or when the hint
+// does not fit the box) we resolve the ambiguity structurally: we try IV
+// sizes 0 (only meaningful with subsample tables), 8 and 16 and require that
+// exactly one fully consumes the box payload.  When several sizes would
+// consume all bytes (only possible when sampleCount is zero, or by structural
+// coincidence) a zero sample count is returned as unambiguously empty and a
+// non-zero count is an error rather than a silent guess.
+func drmParseSenc(p []byte, fallbackIV []byte, ivSizeHint int) ([]drmSencEntry, error) {
 	// version(1) flags(3) sample_count(4) then per-sample: IV[ivSize] [subsample_count(2) pairs...]
 	if len(p) < 8 {
 		return nil, errors.New("senc too short")
@@ -548,7 +670,7 @@ func drmParseSenc(p []byte, fallbackIV []byte) ([]drmSencEntry, error) {
 	const useSubsampleEncryption = 0x000002
 	hasSubs := flags&useSubsampleEncryption != 0
 
-	// Sanity-bound sampleCount before probing: minimum 8 bytes per sample (shortest IV).
+	// Sanity-bound sampleCount before probing: every sample needs at least one byte.
 	if sampleCount > uint32(len(p)-off) {
 		return nil, fmt.Errorf("senc: sample_count %d exceeds remaining box bytes %d", sampleCount, len(p)-off)
 	}
@@ -558,32 +680,56 @@ func drmParseSenc(p []byte, fallbackIV []byte) ([]drmSencEntry, error) {
 
 	// F5: use count-only probes (no entry/IV/subsample allocations) to determine which
 	// IV size exactly fits the box, then allocate once on the confirmed pass.
-	consumed8, err8 := drmParseSencConsumed(payload, int(sampleCount), 8, hasSubs)
-	ok8 := err8 == nil && consumed8 == boxLen
-
-	consumed16, err16 := drmParseSencConsumed(payload, int(sampleCount), 16, hasSubs)
-	ok16 := err16 == nil && consumed16 == boxLen
-
-	var ivSize int
-	switch {
-	case ok8 && !ok16:
-		ivSize = 8
-	case ok16 && !ok8:
-		ivSize = 16
-	case ok8 && ok16:
-		// Both IV sizes parse cleanly and consume all bytes.  For a non-zero
-		// sample count this is structurally ambiguous (the box payload happens
-		// to be consistent with two interpretations); return an error rather
-		// than guessing.  When sampleCount is zero both produce an empty list
-		// which is equivalent regardless of IV size.
-		if sampleCount > 0 {
-			return nil, errors.New("senc: IV size ambiguous: both 8-byte and 16-byte layouts exactly consume the box payload")
+	fits := func(ivSize int) (bool, error) {
+		consumed, err := drmParseSencConsumed(payload, int(sampleCount), ivSize, hasSubs)
+		if err != nil {
+			return false, err
 		}
-		// sampleCount == 0: both probes produce equivalent empty lists; return directly.
-		return []drmSencEntry{}, nil
-	default:
-		// Neither IV size results in a parse that exactly consumes the box payload.
-		return nil, fmt.Errorf("senc: IV size ambiguous or corrupt: 8-byte: %w, 16-byte: %w", err8, err16)
+		if consumed != boxLen {
+			return false, fmt.Errorf("consumed %d of %d payload bytes", consumed, boxLen)
+		}
+		return true, nil
+	}
+
+	ivSize := -1
+	if ivSizeHint == 0 && hasSubs || ivSizeHint == 8 || ivSizeHint == 16 {
+		if ok, _ := fits(ivSizeHint); ok {
+			ivSize = ivSizeHint
+		}
+	}
+
+	if ivSize < 0 {
+		candidates := []int{8, 16}
+		if hasSubs {
+			// Constant-IV schemes (cbcs): no per-sample IV, only subsample tables.
+			candidates = []int{0, 8, 16}
+		}
+		var matches []int
+		var probeErrs []error
+		for _, c := range candidates {
+			ok, err := fits(c)
+			if ok {
+				matches = append(matches, c)
+			} else {
+				probeErrs = append(probeErrs, fmt.Errorf("%d-byte: %w", c, err))
+			}
+		}
+		switch {
+		case len(matches) == 1:
+			ivSize = matches[0]
+		case len(matches) > 1:
+			// Several IV sizes parse cleanly and consume all bytes.  For a
+			// non-zero sample count this is structurally ambiguous; return an
+			// error rather than guessing.  When sampleCount is zero every
+			// probe produces an equivalent empty list.
+			if sampleCount > 0 {
+				return nil, fmt.Errorf("senc: IV size ambiguous: IV sizes %v all exactly consume the box payload", matches)
+			}
+			return []drmSencEntry{}, nil
+		default:
+			// No IV size results in a parse that exactly consumes the box payload.
+			return nil, fmt.Errorf("senc: IV size ambiguous or corrupt: %w", errors.Join(probeErrs...))
+		}
 	}
 
 	// Single allocating pass with the confirmed IV size.
@@ -713,6 +859,7 @@ var drmContainerTypes = map[string]bool{
 	"edts": true,
 	"dinf": true,
 	"udta": true,
+	"schi": true,
 }
 
 func drmParseBoxesAt(b []byte, startOffset, limit, depth int) ([]drmBox, error) {
@@ -911,9 +1058,16 @@ func drmDecryptCTRSubsamples(key, iv []byte, data []byte, subs []drmSubsample) (
 	return data, nil
 }
 
-// drmDecryptCBCSubsamples decrypts only the encrypted subsample spans with AES-CBC.
-// Used for the CBCS protection scheme (pattern-based CBC).
-func drmDecryptCBCSubsamples(key, iv []byte, data []byte, subs []drmSubsample) error {
+// drmDecryptCBCSubsamples decrypts the protected ranges of one sample with
+// AES-CBC as specified for the CENC 'cbcs' scheme (ISO/IEC 23001-7 §10.4).
+//
+// Each protected range (every subsample's encrypted span, or the whole sample
+// when subs is empty) is processed with pattern encryption: cryptBlocks
+// 16-byte blocks are encrypted, then skipBlocks blocks are left clear, and the
+// pattern repeats to the end of the range.  A trailing partial block (fewer
+// than 16 bytes) is always left clear.  cryptBlocks == 0 means no pattern:
+// every full block of the range is encrypted.  Typical video uses 1:9.
+func drmDecryptCBCSubsamples(key, iv []byte, data []byte, subs []drmSubsample, cryptBlocks, skipBlocks int) error {
 	if len(key) != 16 {
 		return fmt.Errorf("CBC subsample: key must be 16 bytes, got %d", len(key))
 	}
@@ -927,6 +1081,9 @@ func drmDecryptCBCSubsamples(key, iv []byte, data []byte, subs []drmSubsample) e
 			iv = iv[:16]
 		}
 	}
+	if cryptBlocks < 0 || skipBlocks < 0 {
+		return fmt.Errorf("CBC subsample: invalid pattern %d:%d", cryptBlocks, skipBlocks)
+	}
 
 	block, err := cachedAESBlock(key) // F2: reuse cached block; avoids key-scheduling per segment
 	if err != nil {
@@ -934,17 +1091,14 @@ func drmDecryptCBCSubsamples(key, iv []byte, data []byte, subs []drmSubsample) e
 	}
 
 	if len(subs) == 0 {
-		if len(data)%aes.BlockSize != 0 {
-			return fmt.Errorf("CBC subsample: data length %d not block-aligned", len(data))
-		}
-		cipher.NewCBCDecrypter(block, iv).CryptBlocks(data, data)
+		drmCBCSPattern(block, iv, data, cryptBlocks, skipBlocks)
 		return nil
 	}
 
 	// Per the CENC 'cbcs' scheme, AES-CBC is re-initialised with the constant
 	// sample IV at the START of each encrypted subsample span — the chain does
 	// NOT carry across subsamples (matches FFmpeg cbcs_scheme_decrypt). A fresh
-	// CBC decrypter is therefore created per span below.
+	// CBC decrypter is therefore created per span (inside drmCBCSPattern).
 	off := 0
 	for _, sub := range subs {
 		off += sub.Clear
@@ -958,16 +1112,31 @@ func drmDecryptCBCSubsamples(key, iv []byte, data []byte, subs []drmSubsample) e
 		if end > len(data) {
 			return fmt.Errorf("CBC subsample: encrypted span [%d:%d] exceeds data len %d", off, end, len(data))
 		}
-		span := data[off:end]
-		if len(span)%aes.BlockSize != 0 {
-			// Truncate to block boundary (partial last block left in clear per spec).
-			aligned := len(span) &^ (aes.BlockSize - 1)
-			span = span[:aligned]
-		}
-		if len(span) > 0 {
-			cipher.NewCBCDecrypter(block, iv).CryptBlocks(span, span)
-		}
+		drmCBCSPattern(block, iv, data[off:end], cryptBlocks, skipBlocks)
 		off = end
 	}
 	return nil
+}
+
+// drmCBCSPattern decrypts span in place with one CBC chain started from iv,
+// applying the crypt:skip block pattern.  The chain continues across crypt
+// runs (skipped blocks take no part in it); a trailing partial block stays clear.
+func drmCBCSPattern(block cipher.Block, iv, span []byte, cryptBlocks, skipBlocks int) {
+	full := len(span) / aes.BlockSize // number of complete blocks
+	if full == 0 {
+		return
+	}
+	dec := cipher.NewCBCDecrypter(block, iv)
+	if cryptBlocks == 0 {
+		dec.CryptBlocks(span[:full*aes.BlockSize], span[:full*aes.BlockSize])
+		return
+	}
+	for blk := 0; blk < full; blk += cryptBlocks + skipBlocks {
+		n := cryptBlocks
+		if blk+n > full {
+			n = full - blk
+		}
+		run := span[blk*aes.BlockSize : (blk+n)*aes.BlockSize]
+		dec.CryptBlocks(run, run)
+	}
 }

@@ -126,6 +126,13 @@ type Options struct {
 	RespHeaders http.Header
 	APIPassword string
 	Proxy       string // per-request upstream proxy override (socks5/http/https)
+
+	// subTokenExp/subTokenIP carry the validity of the signed token that
+	// authorised this request (zero when it was not token-authorised or the
+	// server has no password). When set, rewritten sub-URLs get a freshly
+	// minted per-URL token instead of an unauthenticated URL.
+	subTokenExp int64
+	subTokenIP  string
 }
 
 // DecryptParams carries segment decryption parameters.
@@ -303,6 +310,19 @@ func (h *Handler) parseOptions(r *http.Request) (*Options, error) {
 			}
 		}
 	}
+	// Token-authorised manifest requests carry no api_password, so rewritten
+	// sub-URLs would be unauthenticated and rejected when a password is set.
+	// Remember the parent token's expiry and IP binding so buildProxyURL can
+	// mint per-sub-URL tokens (a token is bound to its endpoint and params
+	// and cannot simply be copied across).
+	if opts.APIPassword == "" && h.cfg.Password != "" && len(h.cfg.Secret) > 0 {
+		if tok := q.Get("token"); tok != "" {
+			if t, err := h.verifyToken(tok, clientIP(r)); err == nil {
+				opts.subTokenExp = t.Exp
+				opts.subTokenIP = t.IP
+			}
+		}
+	}
 	return opts, nil
 }
 
@@ -398,6 +418,9 @@ func (h *Handler) buildProxyURL(extBase, endpoint, dest string, opts *Options) s
 		if opts.APIPassword != "" {
 			b.WriteString("&api_password=")
 			b.WriteString(url.QueryEscape(opts.APIPassword))
+		} else if tok := h.subToken(opts, endpoint, map[string]string{"d": base64.RawURLEncoding.EncodeToString([]byte(dest))}); tok != "" {
+			b.WriteString("&token=")
+			b.WriteString(url.QueryEscape(tok))
 		}
 		if opts.Proxy != "" {
 			b.WriteString("&proxy=")
@@ -481,6 +504,16 @@ func copyAllowedHeaders(w http.ResponseWriter, hdr http.Header) {
 			w.Header().Set(k, v)
 		}
 	}
+}
+
+// setProxySecurityHeaders hardens proxied upstream content: nosniff stops
+// browsers from MIME-sniffing attacker-controlled bytes into HTML/script, and
+// a sandbox CSP strips script/origin privileges should the response be
+// rendered as a document. Set after applyRespHeaders so r_ overrides cannot
+// weaken them.
+func setProxySecurityHeaders(w http.ResponseWriter) {
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "sandbox")
 }
 
 // applyRespHeaders writes RespHeaders overrides to w, skipping any Access-Control-* key.
@@ -574,6 +607,7 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", ct)
 			}
 			applyRespHeaders(w, opts.RespHeaders)
+			setProxySecurityHeaders(w)
 			w.Header().Set("Content-Length", strconv.Itoa(len(decrypted)))
 			w.WriteHeader(http.StatusOK)
 			if r.Method != http.MethodHead {
@@ -589,23 +623,22 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request) {
 		upHdr.Set("Range", rng)
 	}
 
-	// Non-Range GET: use the segment cache when TTL is configured.
-	if r.Method == http.MethodGet && r.Header.Get("Range") == "" && h.cfg.SegCacheTTL > 0 {
-		data, respHdr, status, cErr := h.cachedFetch(ctx, opts.Dest, upHdr, effProxy)
-		if cErr != nil {
-			http.Error(w, "upstream error", http.StatusBadGateway)
+	// Non-Range GET: use the segment cache when configured. Only responses
+	// with a known, small Content-Length are buffered and cached; anything
+	// else (large or chunked bodies, non-200 statuses) is streamed through.
+	useCache := r.Method == http.MethodGet && r.Header.Get("Range") == "" &&
+		h.cfg.SegCacheTTL > 0 && h.cache != nil
+	if useCache {
+		if data, respHdr, status, ok := h.cacheLookup(opts.Dest, upHdr); ok {
+			copyAllowedHeaders(w, respHdr)
+			applyRespHeaders(w, opts.RespHeaders)
+			setProxySecurityHeaders(w)
+			w.WriteHeader(status)
+			_, _ = w.Write(data)
 			return
 		}
-		copyAllowedHeaders(w, respHdr)
-		applyRespHeaders(w, opts.RespHeaders)
-		w.WriteHeader(status)
-		if r.Method != http.MethodHead {
-			_, _ = w.Write(data)
-		}
-		return
 	}
 
-	// Direct streaming path (Range requests, HEAD, or caching off).
 	resp, fetchErr := h.fetch(ctx, r.Method, opts.Dest, upHdr, nil, effProxy)
 	if fetchErr != nil {
 		http.Error(w, "upstream error", http.StatusBadGateway)
@@ -613,8 +646,30 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	if useCache && cacheableResponse(resp) {
+		data, readErr := io.ReadAll(io.LimitReader(resp.Body, maxSegmentBytes+1))
+		if readErr != nil {
+			http.Error(w, "upstream read error", http.StatusBadGateway)
+			return
+		}
+		if int64(len(data)) > maxSegmentBytes {
+			http.Error(w, "upstream segment too large", http.StatusBadGateway)
+			return
+		}
+		h.cache.putFull(cacheKey(opts.Dest, upHdr), data, resp.Header.Clone(), resp.StatusCode)
+		copyAllowedHeaders(w, resp.Header)
+		applyRespHeaders(w, opts.RespHeaders)
+		setProxySecurityHeaders(w)
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(data)
+		return
+	}
+
+	// Direct streaming path (Range requests, HEAD, caching off, or a response
+	// that is unknown-length, too large, or not cacheable).
 	copyAllowedHeaders(w, resp.Header)
 	applyRespHeaders(w, opts.RespHeaders)
+	setProxySecurityHeaders(w)
 	w.WriteHeader(resp.StatusCode)
 	if r.Method != http.MethodHead {
 		bufp := copyBufPool.Get().(*[]byte)
