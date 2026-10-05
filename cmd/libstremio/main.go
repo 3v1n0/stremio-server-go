@@ -115,6 +115,7 @@ func ServerStart(logPath *C.char, envJSON *C.char) (ret C.int) {
 		stopped = nil
 		mu.Unlock()
 		close(myStopped)
+		cancelFn()
 	}()
 
 	logw, closeLog := openLog(logPath)
