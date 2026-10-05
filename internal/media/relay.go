@@ -5,6 +5,8 @@
 package media
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -239,9 +241,27 @@ func (r *mediaRelay) proxy(w http.ResponseWriter, req *http.Request, upstream st
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if req.Method == http.MethodGet && looksLikePlaylist(resp, upstream) {
-		r.servePlaylist(w, resp, upstream)
-		return
+	if req.Method == http.MethodGet {
+		// Sniff the body prefix: ffmpeg detects HLS/DASH by content, not by
+		// Content-Type or extension, so a mislabelled playlist must still
+		// have its nested URIs rewritten through the relay.
+		br := bufio.NewReaderSize(resp.Body, relaySniffBytes)
+		head, _ := br.Peek(relaySniffBytes)
+		resp.Body = struct {
+			io.Reader
+			io.Closer
+		}{br, resp.Body}
+		if looksLikeDASH(upstream, head) {
+			// DASH manifests reference media via BaseURL/SegmentTemplate,
+			// which we do not rewrite; relaying one would let ffmpeg fetch
+			// nested absolute URLs unguarded. Refuse rather than leak.
+			http.Error(w, "dash manifests are not supported by the relay", http.StatusUnsupportedMediaType)
+			return
+		}
+		if looksLikePlaylist(resp, upstream) || hasPlaylistMagic(head) {
+			r.servePlaylist(w, resp, upstream)
+			return
+		}
 	}
 
 	copyProxyHeaders(w.Header(), resp.Header)
@@ -249,6 +269,27 @@ func (r *mediaRelay) proxy(w http.ResponseWriter, req *http.Request, upstream st
 	if req.Method != http.MethodHead {
 		_, _ = io.Copy(w, resp.Body)
 	}
+}
+
+// relaySniffBytes bounds how much of a response body is inspected to detect
+// a playlist/manifest regardless of its declared type.
+const relaySniffBytes = 512
+
+// hasPlaylistMagic reports whether head starts with "#EXTM3U", allowing an
+// optional UTF-8 BOM and leading whitespace.
+func hasPlaylistMagic(head []byte) bool {
+	head = bytes.TrimPrefix(head, []byte("\xef\xbb\xbf"))
+	head = bytes.TrimLeft(head, " \t\r\n")
+	return bytes.HasPrefix(head, []byte("#EXTM3U"))
+}
+
+// looksLikeDASH reports whether the upstream path ends in .mpd or the body
+// prefix contains an MPD root element.
+func looksLikeDASH(upstream string, head []byte) bool {
+	if u, err := url.Parse(upstream); err == nil && strings.HasSuffix(strings.ToLower(u.Path), ".mpd") {
+		return true
+	}
+	return bytes.Contains(head, []byte("<MPD"))
 }
 
 // looksLikePlaylist reports whether resp is (very likely) an HLS playlist,

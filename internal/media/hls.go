@@ -535,6 +535,9 @@ func parseProbeOutput(out []byte) probeMediaResult {
 		return probeMediaResult{}
 	}
 	d, _ := strconv.ParseFloat(r.Format.Duration, 64)
+	if math.IsNaN(d) || math.IsInf(d, 0) || d <= 0 || d > maxSegIdx*segDur {
+		d = 0 // probe failure: bounds the playlist size writePlaylist emits
+	}
 	var audio []audioStream
 	var subs []subtitleStream
 	var subCount int // tracks 0-based index among subtitle streams
