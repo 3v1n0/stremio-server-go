@@ -1320,16 +1320,21 @@ func (s *server) handleSettings(w http.ResponseWriter, r *http.Request) {
 // @Success  307
 // @Router   / [get]
 func (s *server) handleLanding(w http.ResponseWriter, r *http.Request) {
-	scheme := "http://"
+	scheme := "http"
 	if r.TLS != nil {
-		scheme = "https://"
+		scheme = "https"
 	}
-	sep := "?"
-	if strings.Contains(s.cfg.WebUI, "?") {
-		sep = "&"
+	loc, err := url.Parse(s.cfg.WebUI)
+	if err != nil {
+		http.Error(w, "invalid WEB_UI_LOCATION", http.StatusInternalServerError)
+		return
 	}
-	loc := s.cfg.WebUI + sep + "streamingServer=" + url.QueryEscape(scheme+r.Host)
-	http.Redirect(w, r, loc, http.StatusTemporaryRedirect)
+	// Set the parameter on the parsed URL so an existing query string in
+	// WEB_UI_LOCATION is preserved and the query is encoded for us.
+	q := loc.Query()
+	q.Set("streamingServer", scheme+"://"+r.Host)
+	loc.RawQuery = q.Encode()
+	http.Redirect(w, r, loc.String(), http.StatusTemporaryRedirect)
 }
 
 // ---- media helpers --------------------------------------------------------
