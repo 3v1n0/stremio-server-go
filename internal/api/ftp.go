@@ -19,6 +19,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -139,6 +140,10 @@ func (s *server) handleFTP(w http.ResponseWriter, r *http.Request, seg []string)
 	start, hasRange := ftpExtractRangeStart(rangeHdr)
 
 	rc, size, err := ftpstream.Open(r.Context(), payload.FtpURL, start)
+	if errors.Is(err, ftpstream.ErrRangeNotSatisfiable) {
+		http.Error(w, "range not satisfiable", http.StatusRequestedRangeNotSatisfiable)
+		return
+	}
 	if err != nil {
 		http.Error(w, "stream open: "+err.Error(), http.StatusBadGateway)
 		return

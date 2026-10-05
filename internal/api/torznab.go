@@ -21,6 +21,7 @@ import (
 	"encoding/base32"
 	"encoding/hex"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -399,6 +400,11 @@ func tnFetch(r *http.Request, fullURL string) ([]tnItem, error) {
 	}
 	resp, err := tnClient.Do(req)
 	if err != nil {
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			// *url.Error embeds the full URL (incl. apikey); drop it.
+			return nil, fmt.Errorf("do request: %s torznab: %w", ue.Op, ue.Err)
+		}
 		return nil, fmt.Errorf("do request: %w", err)
 	}
 	defer resp.Body.Close()

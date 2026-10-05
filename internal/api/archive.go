@@ -384,14 +384,29 @@ func archiveCheckRedirect(req *http.Request, via []*http.Request) error {
 // re-validates every redirect target, unlike api.go's getClient which is
 // shared with trusted-caller routes and only blocks cloud-metadata.
 var archiveFetchClient = &http.Client{
-	Timeout: 30 * time.Second,
-	Transport: &http.Transport{
+	Timeout:       30 * time.Second,
+	Transport:     newArchiveTransport(),
+	CheckRedirect: archiveCheckRedirect,
+}
+
+// archiveDownloadClient is archiveFetchClient's sibling for large archive
+// bodies (up to archiveMaxDownloadBytes): it has no overall Timeout, which
+// would abort a slow-but-healthy transfer mid-body, but bounds time-to-first-
+// byte via ResponseHeaderTimeout. It keeps the same SSRF guards (dial-time
+// Control hook and per-hop CheckRedirect).
+var archiveDownloadClient = &http.Client{
+	Transport:     newArchiveTransport(),
+	CheckRedirect: archiveCheckRedirect,
+}
+
+func newArchiveTransport() *http.Transport {
+	return &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout: 10 * time.Second,
 			Control: archiveDialControl,
 		}).DialContext,
-	},
-	CheckRedirect: archiveCheckRedirect,
+		ResponseHeaderTimeout: 30 * time.Second,
+	}
 }
 
 // archiveFetchGet performs a guarded GET against u via archiveFetchClient
@@ -544,7 +559,7 @@ func archiveDownload(u string) (string, error) {
 	if err := validateFetchHost(u); err != nil {
 		return "", err
 	}
-	resp, err := archiveFetchClient.Get(u)
+	resp, err := archiveDownloadClient.Get(u)
 	if err != nil {
 		return "", err
 	}

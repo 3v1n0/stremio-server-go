@@ -14,6 +14,7 @@ package ftpstream
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -215,6 +216,10 @@ func openFTP(ctx context.Context, rawURL string, offset int64) (io.ReadCloser, i
 	return &ftpReadCloser{resp: resp, conn: conn}, size, nil
 }
 
+// ErrRangeNotSatisfiable is returned (wrapped) by Open when the requested
+// offset lies beyond the end of the resource.
+var ErrRangeNotSatisfiable = errors.New("requested range not satisfiable")
+
 // openHTTP opens an HTTP or HTTPS connection for rawURL, positioned at offset.
 //
 // When offset > 0, a Range header is sent. The total resource size is inferred
@@ -240,9 +245,25 @@ func openHTTP(ctx context.Context, rawURL string, offset int64) (io.ReadCloser, 
 	if err != nil {
 		return nil, -1, fmt.Errorf("ftpstream: GET %s: %w", rawURL, err)
 	}
+	if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+		_ = resp.Body.Close()
+		return nil, -1, fmt.Errorf("ftpstream: GET %s: %w", rawURL, ErrRangeNotSatisfiable)
+	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		_ = resp.Body.Close()
 		return nil, -1, fmt.Errorf("ftpstream: GET %s: unexpected status %d", rawURL, resp.StatusCode)
+	}
+	// Range ignored: body starts at 0, so skip to the requested offset. When
+	// the offset is already past a known Content-Length, leave the body alone
+	// so the caller can answer 416 using the reported size.
+	if offset > 0 && resp.StatusCode == http.StatusOK && (resp.ContentLength < 0 || offset < resp.ContentLength) {
+		if _, derr := io.CopyN(io.Discard, resp.Body, offset); derr != nil {
+			_ = resp.Body.Close()
+			if errors.Is(derr, io.EOF) {
+				return nil, -1, fmt.Errorf("ftpstream: GET %s: %w", rawURL, ErrRangeNotSatisfiable)
+			}
+			return nil, -1, fmt.Errorf("ftpstream: GET %s: skip to offset: %w", rawURL, derr)
+		}
 	}
 
 	size := int64(-1)
