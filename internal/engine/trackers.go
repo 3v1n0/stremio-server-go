@@ -46,6 +46,12 @@ const probeUDPTimeout = 1 * time.Second
 // probeWSTimeout bounds the WebSocket-tracker reachability handshake.
 const probeWSTimeout = 5 * time.Second
 
+// probeWSFn is the WebSocket prober used by rankWSS (a seam for tests).
+var probeWSFn = probeTrackerWS
+
+// maxWSSProbeConcurrency bounds concurrent WebSocket handshake probes.
+const maxWSSProbeConcurrency = 16
+
 // probeMaxRTT is the sentinel RTT assigned to failed probes so they sort last.
 const probeMaxRTT = time.Hour
 
@@ -213,6 +219,12 @@ func doRefreshTrackers(cache string, maxTrackers int, srcURL string, hc *http.Cl
 
 	// Probe and keep the fastest topN UDP/HTTP trackers.
 	ranked := rankAndKeep(probeable, maxTrackers, proxyURL)
+	if len(ranked) == 0 {
+		// Nothing responded: keep the current list (and cache) rather than
+		// replacing it with dead trackers.
+		logging.For("trackers").Warn("no tracker responded to probes; keeping current list")
+		return
+	}
 
 	// Persist only the ranked UDP/HTTP list; wss are merged at runtime via mergeWS.
 	_ = os.WriteFile(cache, []byte(strings.Join(ranked, "\n")+"\n"), 0o644)
@@ -248,8 +260,8 @@ func fetchTrackerList(rawURL string, hc *http.Client) []string {
 }
 
 // rankAndKeep probes all candidates in parallel, sorts by RTT ascending
-// (failed probes get probeMaxRTT so they sink to the bottom), and returns
-// the top topN entries.
+// and returns the top topN entries. Failed probes (rtt >= probeMaxRTT) are
+// dropped, so the result may be shorter than topN or empty.
 //
 // When proxyURL is set, UDP candidates are never probed: a UDP tracker
 // connect handshake dials the tracker directly and cannot be routed through
@@ -303,6 +315,9 @@ func rankAndKeep(candidates []string, topN int, proxyURL string) []string {
 
 	ranked := make([]string, 0, len(results)+len(skippedUDP))
 	for _, r := range results {
+		if r.rtt >= probeMaxRTT {
+			continue // failed probe: never keep a dead tracker
+		}
 		ranked = append(ranked, r.url)
 	}
 	ranked = append(ranked, skippedUDP...)
@@ -334,6 +349,12 @@ func probeTracker(rawURL string, proxyURL string) time.Duration {
 func probeTrackerHTTP(rawURL string, proxyURL string) time.Duration {
 	hc := newTrackerClient(proxyURL)
 	hc.Timeout = probeHTTPTimeout
+	// Each probe owns a throwaway Transport: disable keep-alives and drop any
+	// idle connection on return so probes never leak sockets/goroutines.
+	if tr, ok := hc.Transport.(*http.Transport); ok {
+		tr.DisableKeepAlives = true
+	}
+	defer hc.CloseIdleConnections()
 	start := time.Now()
 	resp, err := hc.Head(rawURL)
 	if err == nil {
@@ -458,11 +479,14 @@ func rankWSS(list []string) []string {
 	}
 	results := make([]bool, len(uniq))
 	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxWSSProbeConcurrency)
 	for i, u := range uniq {
 		wg.Add(1)
+		sem <- struct{}{} // acquire; bounds in-flight handshakes
 		go func(idx int, url string) {
 			defer wg.Done()
-			results[idx] = probeTrackerWS(url)
+			defer func() { <-sem }()
+			results[idx] = probeWSFn(url)
 		}(i, u)
 	}
 	wg.Wait()
