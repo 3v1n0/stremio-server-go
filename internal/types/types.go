@@ -29,8 +29,8 @@ type Config struct {
 	// When set it is used verbatim for the GET / landing redirect and the
 	// /settings baseUrl instead of deriving them from r.TLS / the first local
 	// interface, which are wrong when TLS terminates at an edge proxy. It is
-	// also the fallback for ProxyPublicURL and LocalFilesPublicURL when their
-	// own values are unset.
+	// also the fallback for ProxyPublicURL when that is unset (but never for
+	// LocalFilesPublicURL, which must be opted into explicitly).
 	PublicURL   string
 	Version     string // value reported as settings.serverVersion
 	TrackersMax int    // max ranked UDP/HTTP trackers per torrent (STREMIO_TRACKERS_MAX; 0 = default)

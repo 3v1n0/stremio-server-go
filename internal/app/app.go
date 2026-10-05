@@ -110,16 +110,15 @@ func Run(ctx context.Context, cfg Config, logw io.Writer) error {
 		return err
 	}
 	publicURL := publicBaseURL(lookup, "STREMIO_PUBLIC_URL")
-	// STREMIO_PUBLIC_URL is the general base: the stream proxy and the
-	// local-files add-on fall back to it when their own URL is unset.
+	// STREMIO_PUBLIC_URL is the general base the stream proxy falls back to
+	// when its own URL is unset. It deliberately does NOT enable the
+	// local-files HTTP endpoint: that stays an explicit opt-in via
+	// STREMIO_LOCAL_FILES_PUBLIC_URL, since it exposes file downloads.
 	proxyPublicURL := strings.TrimRight(getenv(lookup, "STREMIO_PROXY_PUBLIC_URL", ""), "/")
 	if proxyPublicURL == "" {
 		proxyPublicURL = publicURL
 	}
 	localFilesPublicURL := strings.TrimRight(getenv(lookup, "STREMIO_LOCAL_FILES_PUBLIC_URL", ""), "/")
-	if localFilesPublicURL == "" {
-		localFilesPublicURL = publicURL
-	}
 	tcfg := types.Config{
 		HTTPPort:            envInt(lookup, "HTTP_PORT", 11470),
 		HTTPSPort:           envInt(lookup, "HTTPS_PORT", 12470), // self-signed HTTPS for https web UIs (WebKitGTK)
