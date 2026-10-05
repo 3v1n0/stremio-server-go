@@ -70,7 +70,7 @@ type engine struct {
 	lastDLSpeed      float64          // cached bytes/sec from last Stats(); used for readahead scaling
 	selected         map[int]struct{} // file indices marked for background download
 	primed           map[int]struct{} // file indices whose moov/header pieces are primed (once each)
-	lastAccess       time.Time        // updated on NewReader/Stats; used by the janitor for LRU eviction
+	lastAccess       time.Time        // last real use (EnsureEngine reuse, NewReader, reader Close, per-torrent Stats); global AllStats does not bump it; drives janitor LRU/idle
 	openReaders      int              // active NewReader handles; >0 pins the torrent against eviction
 	reading          map[int]int      // file idx -> open reader count; a file with readers is never demoted
 	tailWarmed       map[int]struct{} // file idx -> tail (moov) actively pre-read once, to beat front starvation
@@ -538,6 +538,8 @@ func (m *manager) NumTorrents() int {
 }
 
 // AllStats returns torrent-level stats (idx=-1) keyed by lower-cased infoHash.
+// It is read-only observability: unlike a per-torrent Stats call it does not
+// refresh any torrent's idle clock (issue #41).
 func (m *manager) AllStats() map[string]*types.Stats {
 	m.mu.RLock()
 	snap := make(map[string]*engine, len(m.engines))
@@ -548,7 +550,7 @@ func (m *manager) AllStats() map[string]*types.Stats {
 
 	result := make(map[string]*types.Stats, len(snap))
 	for ih, e := range snap {
-		result[ih] = e.Stats(-1)
+		result[ih] = e.stats(-1, false)
 	}
 	return result
 }
@@ -890,7 +892,8 @@ func (m *manager) evict(budget int64) {
 }
 
 // purgeReaderless drops every engine in snap that currently has no open
-// readers and has been idle (no NewReader/Stats access) for at least
+// readers and has been idle (no EnsureEngine/NewReader/reader-Close or
+// per-torrent Stats; the global AllStats does not count) for at least
 // threshold, logging each removal under event. It is the shared reader-less
 // scan used by both evict(0) ("no caching", threshold = the fixed grace
 // window) and evictIdle (threshold = the configured idle timeout).
@@ -1370,6 +1373,12 @@ func (p *pinnedReader) Close() error {
 		var demote bool
 		p.e.mu.Lock()
 		p.e.openReaders--
+		// The idle clock restarts when the stream is released, not when it was
+		// opened: otherwise a long playback (lastAccess = NewReader time, and
+		// nothing may have polled its stats) would look idle for hours the
+		// instant it stops and be dropped on the next janitor tick, instead of
+		// surviving the configured idle window for instant resume.
+		p.e.lastAccess = time.Now()
 		if p.e.reading[p.idx] > 0 {
 			p.e.reading[p.idx]--
 		}
@@ -1503,7 +1512,18 @@ func (e *engine) GuessFileIdx() int {
 // Stats returns a types.Stats snapshot. When idx >= 0 the per-file stream
 // fields (StreamLen, StreamName, StreamProgress) are also populated.
 // Download/upload speeds are computed from byte deltas between successive calls.
+//
+// A per-torrent Stats call counts as use and refreshes the idle clock: it backs
+// /{ih}/stats.json and /{ih}/{idx}/stats.json, which the stremio-core player
+// polls only while that torrent is open (e.g. paused with the HTTP reader
+// dropped), so the torrent stays resident for an instant resume. The global
+// /stats.json aggregate goes through AllStats, which does not refresh it.
 func (e *engine) Stats(idx int) *types.Stats {
+	return e.stats(idx, true)
+}
+
+// stats is Stats with control over whether the call refreshes lastAccess.
+func (e *engine) stats(idx int, touch bool) *types.Stats {
 	ts := e.t.Stats()
 
 	// Bandwidth counters — ConnStats is embedded directly in TorrentStats →
@@ -1522,7 +1542,14 @@ func (e *engine) Stats(idx int) *types.Stats {
 		}
 	}
 	e.last = speedSample{at: now, downloaded: dl, uploaded: ul}
-	e.lastAccess = now // update LRU timestamp inside the already-held lock
+	// Only a per-torrent query counts as use. AllStats (the global /stats.json,
+	// polled continuously by dashboards and monitors across every torrent)
+	// passes touch=false: counting those polls reset the idle clock on every
+	// call and kept abandoned torrents resident forever, so
+	// STREMIO_TORRENT_IDLE_TIMEOUT never fired (issue #41).
+	if touch {
+		e.lastAccess = now
+	}
 	if dlSpeed > 0 {
 		e.lastDLSpeed = dlSpeed // cache for NewReader readahead scaling
 	}
