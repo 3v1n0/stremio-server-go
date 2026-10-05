@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Gianluca Boiano
+//
+// SPDX-License-Identifier: MIT
+
 // Package earlyenv adjusts process environment that third-party packages read
 // in their own init() functions, before those init() functions run.
 //

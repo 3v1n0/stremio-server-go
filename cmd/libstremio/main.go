@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Gianluca Boiano
+//
+// SPDX-License-Identifier: MIT
+
 // Command libstremio builds libstremio-server.so, a c-shared version of
 // stremio-server for SELinux-enforcing Android hosts where the shell's exec()
 // of a bundled executable is blocked by policy but dlopen() of a shared

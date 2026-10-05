@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Gianluca Boiano
+//
+// SPDX-License-Identifier: MIT
+
 package media
 
 // Tests for pure and offline-testable helpers in internal/media.

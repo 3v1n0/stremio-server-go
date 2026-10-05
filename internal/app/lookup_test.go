@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Gianluca Boiano
+//
+// SPDX-License-Identifier: MIT
+
 package app
 
 // Tests for the issue #20 config-parsing helpers added to lookup.go/app.go:

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Gianluca Boiano
+//
+// SPDX-License-Identifier: MIT
+
 // Package ftpstream provides a unified Open function for streaming files from
 // FTP/FTPS servers and HTTP/HTTPS URLs.
 //

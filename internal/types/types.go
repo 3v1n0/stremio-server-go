@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Gianluca Boiano
+//
+// SPDX-License-Identifier: MIT
+
 // Package types holds the shared contract between the engine, api, settings and
 // media packages. Everything stremio-web depends on is mirrored here so the
 // individual packages can be developed independently against a stable surface.

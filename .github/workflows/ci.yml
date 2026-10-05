@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Gianluca Boiano
+#
+# SPDX-License-Identifier: MIT
+
 name: CI
 
 on:
@@ -35,6 +39,8 @@ jobs:
           fi
       - name: go vet
         run: go vet ./...
+      - name: REUSE compliance (SPDX headers)
+        run: pipx run reuse lint
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:

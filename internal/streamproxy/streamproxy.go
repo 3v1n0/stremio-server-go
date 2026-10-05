@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Gianluca Boiano
+//
+// SPDX-License-Identifier: MIT
+
 // Package streamproxy implements an HTTP stream proxy with HLS/DASH manifest
 // rewriting, optional segment decryption, signed URLs, and caching.
 package streamproxy

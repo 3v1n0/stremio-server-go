@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Gianluca Boiano
+//
+// SPDX-License-Identifier: MIT
+
 // Package archive provides a uniform streaming reader over local archive files
 // (zip, tar, tgz, rar, 7zip). All implementations are pure Go; no cgo or
 // external binaries are required.

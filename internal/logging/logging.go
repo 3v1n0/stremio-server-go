@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Gianluca Boiano
+//
+// SPDX-License-Identifier: MIT
+
 // Package logging provides the application's structured logger, built on the
 // standard library's log/slog. It offers leveled, component-tagged, key=value
 // logging with a compact human-readable text format (the default) or JSON.

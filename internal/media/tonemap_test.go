@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Gianluca Boiano
+//
+// SPDX-License-Identifier: MIT
+
 package media
 
 // Tests for internal/media/tonemap.go and its integration points: HDR

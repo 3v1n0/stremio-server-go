@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Gianluca Boiano
+//
+// SPDX-License-Identifier: MIT
+
 // Package engine wraps anacrolix/torrent to provide the EngineManager and
 // Engine interfaces declared in internal/types. It creates a single dual-stack
 // (IPv4+IPv6, TCP+uTP, BEP32 DHT) torrent Client and exposes idempotent torrent

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Gianluca Boiano
+//
+// SPDX-License-Identifier: MIT
+
 // Package api — regression tests for SEC-3 (review 2026-09-22): archiveDownload
 // and nzb.go's NZB-XML fetch used getClient (api.go), whose dialer only blocks
 // the cloud-metadata address and whose default redirect handling follows any

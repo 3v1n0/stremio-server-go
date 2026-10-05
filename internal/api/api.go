@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Gianluca Boiano
+//
+// SPDX-License-Identifier: MIT
+
 // Package api implements the enginefs-compatible HTTP surface that stremio-web
 // expects from a Stremio streaming server. It depends only on the interfaces in
 // internal/types, so the engine/settings/media implementations are pluggable.

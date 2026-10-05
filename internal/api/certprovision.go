@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Gianluca Boiano
+//
+// SPDX-License-Identifier: MIT
+
 // Package api — shared TLS-certificate provisioning used by both the
 // GET /get-https handler and the background auto-renewer (cmd/stremio-server).
 //

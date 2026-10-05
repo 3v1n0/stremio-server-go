@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Gianluca Boiano
+//
+// SPDX-License-Identifier: MIT
+
 // Package netguard provides SSRF protection primitives shared across the
 // outbound-fetch paths (proxy, /create blob, ftpstream HTTP). It exposes both a
 // URL/host pre-flight check and a dialer Control hook that re-validates the

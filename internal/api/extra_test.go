@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Gianluca Boiano
+//
+// SPDX-License-Identifier: MIT
+
 // Package api — fourth batch of tests covering stream handlers with empty
 // config, eviction routines, archive extraction, and torznab queries.
 package api

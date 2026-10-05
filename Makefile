@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Gianluca Boiano
+#
+# SPDX-License-Identifier: MIT
+
 # stremio-server-go
 
 BINARY      := stremio-server

@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 Gianluca Boiano
+
+SPDX-License-Identifier: MIT
+-->
+
 # stremio-server-go
 
 A lightweight, **IPv6-capable**, open-source drop-in replacement for Stremio's

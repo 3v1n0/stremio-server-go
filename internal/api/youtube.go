@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Gianluca Boiano
+//
+// SPDX-License-Identifier: MIT
+
 // Package api — GET /yt/:id and GET /yt/:id.json
 //
 // Shells out to the system yt-dlp binary to resolve YouTube video formats.

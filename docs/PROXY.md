@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 Gianluca Boiano
+
+SPDX-License-Identifier: MIT
+-->
+
 # Stream Proxy
 
 `stremio-server-go` ships a pure-Go HTTP stream proxy that augments the legacy

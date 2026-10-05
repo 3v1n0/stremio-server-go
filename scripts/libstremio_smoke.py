@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-FileCopyrightText: 2026 Gianluca Boiano
+#
+# SPDX-License-Identifier: MIT
+
 """ctypes smoke test for libstremio-server.so (built from ./cmd/libstremio).
 
 Loads the shared library, starts the server on a background thread (per the

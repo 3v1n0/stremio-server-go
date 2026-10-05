@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Gianluca Boiano
+//
+// SPDX-License-Identifier: MIT
+
 // Package api — FTP/FTPS and HTTP(S) direct streaming via the /ftp route.
 //
 // GET|HEAD /ftp/{filename}?lz=<encoded>

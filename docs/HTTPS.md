@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 Gianluca Boiano
+
+SPDX-License-Identifier: MIT
+-->
+
 # HTTPS for the Stremio UI ("HTTPS endpoint for streaming")
 
 Stremio's settings panel shows an **"HTTPS endpoint for streaming"**

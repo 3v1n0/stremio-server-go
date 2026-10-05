@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Gianluca Boiano
+//
+// SPDX-License-Identifier: MIT
+
 // Package media implements types.MediaProber, backing the ffprobe/ffmpeg helper
 // routes. All external I/O is done via os/exec (ffprobe) or the standard
 // net/http client; no third-party dependencies are required.

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Gianluca Boiano
+//
+// SPDX-License-Identifier: MIT
+
 // Package api — DLNA/UPnP casting device discovery and AVTransport control.
 //
 // GET /casting         → discover UPnP MediaRenderers, return

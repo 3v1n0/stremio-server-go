@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Gianluca Boiano
+//
+// SPDX-License-Identifier: MIT
+
 // Package api — fifth batch: queryBitmagnet and bitmagnet/torznab stream
 // handlers exercised through mocked backends via httptest.
 package api

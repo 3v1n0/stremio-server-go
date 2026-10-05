@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Gianluca Boiano
+//
+// SPDX-License-Identifier: MIT
+
 // Package api — archive streaming for zip / rar / 7zip / tar / tgz
 //
 // Routes dispatched by handleArchive (seg[0] is the format extension):

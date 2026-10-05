@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 Gianluca Boiano
+
+SPDX-License-Identifier: MIT
+-->
+
 # Container Deployment
 
 The project ships a multi-stage `Dockerfile` (Podman/Docker) that compiles

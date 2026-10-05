@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Gianluca Boiano
+//
+// SPDX-License-Identifier: MIT
+
 // Package api — third batch of tests covering manifest routes, addon handlers,
 // YouTube handler, certprovision helpers, torznab helpers, and more.
 package api

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Gianluca Boiano
+//
+// SPDX-License-Identifier: MIT
+
 // Package api integration tests for the client-disconnect / reader-leak fix in
 // handleStream (bug 2): a client that disconnects mid-stream while the
 // underlying reader is blocked must have that reader closed promptly, and the

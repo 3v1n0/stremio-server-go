@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Gianluca Boiano
+//
+// SPDX-License-Identifier: MIT
+
 // Package settings implements types.SettingsStore: it holds the user-facing
 // server settings, persists them to <appPath>/server-settings.json, and
 // exposes the GUI schema expected by stremio-web's settings panel.
