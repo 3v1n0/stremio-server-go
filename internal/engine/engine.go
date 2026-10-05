@@ -1208,16 +1208,53 @@ func (e *engine) warmMoov(idx int) {
 			off = 0
 		}
 		if _, err := r.Seek(off, io.SeekStart); err != nil {
+			e.abandonTailWarm(idx)
 			return
 		}
 		buf := make([]byte, 64<<10)
 		for {
 			n, err := r.ReadContext(ctx, buf) // bounded; errors on timeout or torrent drop
 			if n == 0 || err != nil {
+				// Timed out or the torrent was dropped: the tail window is
+				// still marked Readahead, so it keeps being requested with no
+				// reader wanting it. Drop it and allow a later reader to warm
+				// it again.
+				e.abandonTailWarm(idx)
 				return
 			}
 		}
 	}()
+}
+
+// abandonTailWarm gives up on a bounded tail pre-read that did not complete:
+// it demotes the file's pieces back to "not wanted" (the readahead window the
+// warm reader set) and clears the once-only marker so a later NewReader can
+// retry, instead of leaving the tail requested forever with no reader.
+func (e *engine) abandonTailWarm(idx int) {
+	e.mu.Lock()
+	delete(e.tailWarmed, idx)
+	// Reader and selection state are read under one lock so the demotion
+	// decision cannot race a concurrent NewReader or Close.
+	wanted := e.tailWarmWantedLocked(idx)
+	e.mu.Unlock()
+	if wanted || !e.hasInfo() {
+		return
+	}
+	files := e.t.Files()
+	if idx >= 0 && idx < len(files) {
+		files[idx].SetPriority(torrent.PiecePriorityNone)
+	}
+}
+
+// tailWarmWantedLocked reports whether file idx is still wanted, i.e. whether a
+// reader is streaming it or it is selected for full background download. Callers
+// hold e.mu.
+func (e *engine) tailWarmWantedLocked(idx int) bool {
+	if e.reading[idx] > 0 {
+		return true
+	}
+	_, selected := e.selected[idx]
+	return selected
 }
 
 // needsTailWarm walks the leading MP4 box headers and reports false only when it
