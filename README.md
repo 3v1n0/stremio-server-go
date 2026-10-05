@@ -387,6 +387,12 @@ char* ServerVersion(void);                       /* static, do not free */
 ```
 
 `envJSON` is an object of the same environment variables the executable reads.
+Keys that are read straight from the process environment (`STREMIO_LOG_LEVEL`,
+`STREMIO_LOG_FORMAT`, `STREMIO_HWACCEL`, `STREMIO_ARCHIVE_ALLOW_PRIVATE`,
+`STREMIO_ARCHIVE_LOCAL_ROOT`, `STREMIO_FTP_ALLOW_PRIVATE`, `LOCAL_FILES_DIR`) are
+exported for the duration of `ServerStart` and restored afterwards.
+`STREMIO_SERVER_VERSION` (library mode only) overrides the `serverVersion`
+reported in `/settings`; `ServerVersion()` always returns the compiled default.
 Start may be called again after Stop. The library never installs signal
 handlers or calls `os.Exit`; Go cannot unload it (golang/go#11100), so load it
 once per process. `scripts/libstremio_smoke.py` exercises it through ctypes.
@@ -425,7 +431,13 @@ arbitrary page from silently driving the API just because the port is
 reachable, state-changing routes and `/proxy` check the request's `Origin`
 header against an allowlist (see `STREMIO_ALLOWED_ORIGINS` above); requests
 with no `Origin` header (native players, curl, most non-browser clients) are
-unaffected.
+unaffected. Browsers omit `Origin` on cross-site links, images and iframes, so
+a request with no `Origin` but `Sec-Fetch-Site: cross-site` is refused (`403`)
+on side-effecting routes (`/removeAll`, `/{infoHash}/create|remove`,
+`/get-https`, `/casting`); media routes loaded by `<video>` or native HLS are
+not affected. Proxied and streamed content is served with
+`X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox`, so an
+HTML/SVG body cannot run script on the server's own origin.
 
 By design the server shells out to `ffmpeg`/`yt-dlp` and acts as an open
 reverse proxy (`/proxy`) for the local web UI. Remote URLs given to
@@ -435,7 +447,9 @@ guarded loopback relay, so the subprocess only ever talks to this server and
 the SSRF guard (private/loopback/link-local/cloud-metadata blocking,
 re-checked at dial time to defeat DNS rebinding) governs the actual fetch.
 The same dial-time guard, including redirects, covers archive/NZB downloads
-(`STREMIO_ARCHIVE_ALLOW_PRIVATE`) and FTP (`STREMIO_FTP_ALLOW_PRIVATE`).
+(`STREMIO_ARCHIVE_ALLOW_PRIVATE`) and FTP (`STREMIO_FTP_ALLOW_PRIVATE`). The
+relay recognises HLS playlists by content as well as by type, and refuses
+DASH manifests (`415`), whose nested URLs it does not rewrite.
 
 ## License
 
