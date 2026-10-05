@@ -1,11 +1,16 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 package engine
 
 import (
 	"testing"
 
-	"github.com/M0Rf30/stremio-server-go/internal/types"
 	"github.com/anacrolix/torrent/bencode"
 	"github.com/anacrolix/torrent/metainfo"
+
+	"github.com/M0Rf30/stremio-server-go/internal/types"
 )
 
 // newTailWarmTestEngine builds an engine with a real single-file torrent whose
