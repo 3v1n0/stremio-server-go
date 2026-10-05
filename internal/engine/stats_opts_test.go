@@ -1,10 +1,15 @@
+// SPDX-FileCopyrightText: 2026 The stremio-server-go Authors
+//
+// SPDX-License-Identifier: MIT
+
 package engine
 
 import (
 	"testing"
 
-	"github.com/M0Rf30/stremio-server-go/internal/types"
 	"github.com/anacrolix/torrent"
+
+	"github.com/M0Rf30/stremio-server-go/internal/types"
 )
 
 func newStatsOptsManager(t *testing.T) *manager {
