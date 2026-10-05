@@ -215,6 +215,29 @@ func TestHLSSessionWritePlaylist(t *testing.T) {
 	}
 }
 
+// playlist.m3u8 and video.m3u8 share segPrefix "" but are distinct files; both
+// must be written regardless of request order.
+func TestHLSSessionWritePlaylistSharedPrefix(t *testing.T) {
+	dir := t.TempDir()
+	s := &hlsSession{dir: dir, duration: 10.0, segLocks: map[string]*sync.Mutex{}}
+	for _, name := range []string{"playlist.m3u8", "video.m3u8"} {
+		p := filepath.Join(dir, name)
+		if err := s.writePlaylist(p, ""); err != nil {
+			t.Fatalf("writePlaylist(%s): %v", name, err)
+		}
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatalf("%s not written: %v", name, err)
+		}
+		if !strings.Contains(string(raw), "seg2.ts") {
+			t.Errorf("%s content wrong:\n%s", name, raw)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "video.m3u8.tmp")); err == nil {
+		t.Error("temp file left behind")
+	}
+}
+
 func TestHLSSessionWritePlaylistAudioPrefix(t *testing.T) {
 	dir := t.TempDir()
 	s := &hlsSession{dir: dir, duration: 8.0, segLocks: map[string]*sync.Mutex{}}

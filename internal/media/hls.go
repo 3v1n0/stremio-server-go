@@ -1121,7 +1121,7 @@ func (m *hlsManager) HLSFile(ctx context.Context, id, name string) (string, stri
 func (s *hlsSession) writePlaylist(path, segPrefix string) error {
 	// Check cache under read-lock; playlist bytes are immutable once duration is set.
 	s.mu.RLock()
-	_, ok := s.playlistData[segPrefix]
+	_, ok := s.playlistData[path]
 	dur := s.duration
 	s.mu.RUnlock()
 	if ok {
@@ -1149,16 +1149,25 @@ func (s *hlsSession) writePlaylist(path, segPrefix string) error {
 	}
 	b.WriteString("#EXT-X-ENDLIST\n")
 	data := []byte(b.String())
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	// Write via temp file + rename so a concurrent reader never sees a
+	// truncated playlist.
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return err
 	}
-	// Store rendered bytes so future requests for the same segPrefix skip the
-	// O(n_segments) format loop and disk write entirely.
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	// Store rendered bytes so future requests for the same path skip the
+	// O(n_segments) format loop and disk write entirely.  Keyed by path, not
+	// segPrefix: playlist.m3u8 and video.m3u8 share prefix "" but are
+	// distinct files.
 	s.mu.Lock()
 	if s.playlistData == nil {
 		s.playlistData = make(map[string]struct{})
 	}
-	s.playlistData[segPrefix] = struct{}{}
+	s.playlistData[path] = struct{}{}
 	s.mu.Unlock()
 	return nil
 }
