@@ -119,9 +119,13 @@ func dashBuildTemplateURL(h *Handler, ext, abs string, opts *Options) string {
 }
 
 // dashRewrite rewrites URL-bearing tokens in an MPEG-DASH MPD document so that
-// all media references are routed through the proxy.  It uses a streaming
-// token-based approach (encoding/xml) to preserve all other XML structure,
-// attributes, and namespace declarations verbatim.
+// all media references are routed through the proxy.  It tokenises with
+// xml.Decoder.RawToken (no namespace translation) and copies every untouched
+// token verbatim from the input using byte offsets, so namespace declarations
+// (xmlns, xmlns:xsi, ...), prefixed attributes (xsi:schemaLocation,
+// cenc:default_KID, ...), comments, and whitespace survive unchanged.  Only
+// start tags whose attributes are rewritten are re-serialised, keeping prefixes
+// and escaping attribute values.
 //
 // Rewritten tokens:
 //   - <BaseURL> character data — resolved and proxied via /proxy/stream
@@ -133,30 +137,41 @@ func dashBuildTemplateURL(h *Handler, ext, abs string, opts *Options) string {
 //   - <Initialization sourceURL="…"> attribute — resolved and proxied via
 //     buildProxyURL; the range attribute is left untouched.
 //
-// If XML tokenisation fails at any point the original bytes are returned
-// unchanged (best-effort; no panics).
+// If XML tokenisation fails at any point, or the element nesting is not
+// balanced, the original bytes are returned unchanged (best-effort; no panics).
 //
 // Limitation: nested BaseURL chains are each resolved against opts.Dest rather
 // than against each other's accumulated base.
 func dashRewrite(h *Handler, r *http.Request, opts *Options, mpd []byte) []byte {
 	dec := xml.NewDecoder(bytes.NewReader(mpd))
 	var buf bytes.Buffer
-	enc := xml.NewEncoder(&buf)
 
 	extBase := h.externalBase(r)
 	inBaseURL := false
+	var stack []string
+	var prev int64
 
 	for {
-		tok, err := dec.Token()
+		tok, err := dec.RawToken()
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
 			return mpd
 		}
+		cur := dec.InputOffset()
+		raw := mpd[prev:cur]
+		prev = cur
 
 		switch t := tok.(type) {
 		case xml.StartElement:
+			stack = append(stack, dashQName(t.Name))
+
+			changed := false
+			rewrite := func(i int, v string) {
+				t.Attr[i].Value = v
+				changed = true
+			}
 			switch t.Name.Local {
 			case "BaseURL":
 				inBaseURL = true
@@ -166,7 +181,7 @@ func dashRewrite(h *Handler, r *http.Request, opts *Options, mpd []byte) []byte 
 					switch attr.Name.Local {
 					case "initialization", "media":
 						abs := resolveURL(opts.Dest, attr.Value)
-						t.Attr[i].Value = dashBuildTemplateURL(h, extBase, abs, opts)
+						rewrite(i, dashBuildTemplateURL(h, extBase, abs, opts))
 					}
 				}
 
@@ -176,7 +191,7 @@ func dashRewrite(h *Handler, r *http.Request, opts *Options, mpd []byte) []byte 
 					case "media", "index":
 						if attr.Value != "" {
 							abs := resolveURL(opts.Dest, attr.Value)
-							t.Attr[i].Value = h.buildProxyURL(extBase, "/proxy/stream", abs, opts)
+							rewrite(i, h.buildProxyURL(extBase, "/proxy/stream", abs, opts))
 						}
 					}
 				}
@@ -185,46 +200,75 @@ func dashRewrite(h *Handler, r *http.Request, opts *Options, mpd []byte) []byte 
 				for i, attr := range t.Attr {
 					if attr.Name.Local == "sourceURL" {
 						abs := resolveURL(opts.Dest, attr.Value)
-						t.Attr[i].Value = h.buildProxyURL(extBase, "/proxy/stream", abs, opts)
+						rewrite(i, h.buildProxyURL(extBase, "/proxy/stream", abs, opts))
 					}
 				}
 			}
 
-			if err := enc.EncodeToken(t); err != nil {
-				return mpd
+			if !changed {
+				buf.Write(raw)
+				continue
 			}
+			buf.WriteByte('<')
+			buf.WriteString(dashQName(t.Name))
+			for _, a := range t.Attr {
+				buf.WriteByte(' ')
+				buf.WriteString(dashQName(a.Name))
+				buf.WriteString(`="`)
+				if err := xml.EscapeText(&buf, []byte(a.Value)); err != nil {
+					return mpd
+				}
+				buf.WriteByte('"')
+			}
+			if bytes.HasSuffix(raw, []byte("/>")) {
+				buf.WriteByte('/')
+			}
+			buf.WriteByte('>')
 
 		case xml.EndElement:
 			inBaseURL = false
-			if err := enc.EncodeToken(t); err != nil {
+			if len(stack) == 0 || stack[len(stack)-1] != dashQName(t.Name) {
 				return mpd
 			}
+			stack = stack[:len(stack)-1]
+			// The synthetic end of a self-closing tag consumes no input
+			// (raw is empty); the start tag already carried the "/>".
+			buf.Write(raw)
 
 		case xml.CharData:
 			if inBaseURL {
-				raw := strings.TrimSpace(string(t))
-				if raw != "" {
-					abs := resolveURL(opts.Dest, raw)
+				trimmed := strings.TrimSpace(string(t))
+				if trimmed != "" {
+					abs := resolveURL(opts.Dest, trimmed)
 					proxied := h.buildProxyURL(extBase, "/proxy/stream", abs, opts)
-					t = xml.CharData(proxied)
 					inBaseURL = false // consumed; EndElement handles the empty-content case
+					if err := xml.EscapeText(&buf, []byte(proxied)); err != nil {
+						return mpd
+					}
+					continue
 				}
 				// whitespace-only: keep inBaseURL=true so the real URL on the
 				// next CharData token is still caught
 			}
-			if err := enc.EncodeToken(t); err != nil {
-				return mpd
-			}
+			buf.Write(raw)
 
 		default:
-			if err := enc.EncodeToken(tok); err != nil {
-				return mpd
-			}
+			buf.Write(raw)
 		}
 	}
 
-	if err := enc.Flush(); err != nil {
+	if len(stack) != 0 {
 		return mpd
 	}
+	buf.Write(mpd[prev:])
 	return buf.Bytes()
+}
+
+// dashQName renders an element or attribute name as it appeared in the source
+// (prefix:local) from a RawToken name, where Space holds the unresolved prefix.
+func dashQName(n xml.Name) string {
+	if n.Space == "" {
+		return n.Local
+	}
+	return n.Space + ":" + n.Local
 }

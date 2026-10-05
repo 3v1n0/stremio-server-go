@@ -216,3 +216,107 @@ func TestDashRewriteInvalidXMLFallback(t *testing.T) {
 		t.Errorf("expected original bytes returned on invalid XML; got %q", out)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Namespace preservation
+// ---------------------------------------------------------------------------
+
+const dashNamespacedMPD = `<?xml version="1.0" encoding="UTF-8"?>
+<!-- keep me -->
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:cenc="urn:mpeg:cenc:2013" xsi:schemaLocation="urn:mpeg:dash:schema:mpd:2011 DASH-MPD.xsd" type="static" mediaPresentationDuration="PT10S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4">
+      <ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011" value="cenc" cenc:default_KID="01234567-89ab-cdef-0123-456789abcdef"/>
+      <BaseURL>https://cdn.example/dash/?a=1&amp;b=2</BaseURL>
+      <Representation id="video" bandwidth="1500000">
+        <SegmentTemplate initialization="init-$RepresentationID$.m4s" media="seg-$Number$.m4s" startNumber="1"></SegmentTemplate>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>`
+
+func TestDashRewritePreservesNamespaces(t *testing.T) {
+	h := dashNewTestHandler()
+	req := httptest.NewRequest("GET", "/proxy/mpd/manifest.m3u8?d=x", nil)
+	opts := &Options{Dest: "https://origin.example/stream/master.mpd"}
+	out := string(dashRewrite(h, req, opts, []byte(dashNamespacedMPD)))
+
+	for _, want := range []string{
+		`xmlns="urn:mpeg:dash:schema:mpd:2011"`,
+		`xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"`,
+		`xmlns:cenc="urn:mpeg:cenc:2013"`,
+		`xsi:schemaLocation="urn:mpeg:dash:schema:mpd:2011 DASH-MPD.xsd"`,
+		`cenc:default_KID="01234567-89ab-cdef-0123-456789abcdef"`,
+		`<!-- keep me -->`,
+		`<?xml version="1.0" encoding="UTF-8"?>`,
+	} {
+		if strings.Count(out, want) != 1 {
+			t.Errorf("expected exactly one %q in output:\n%s", want, out)
+		}
+	}
+	for _, bad := range []string{"_xmlns", "xmlns:_", "_:default_KID", "xmlns:xmlns"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("output contains mangled namespace token %q:\n%s", bad, out)
+		}
+	}
+
+	// Well-formed, no duplicate attributes, prefixes resolved.
+	dec := xml.NewDecoder(strings.NewReader(out))
+	var sawKID, sawSchema bool
+	for {
+		tok, err := dec.Token()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("output is not well-formed XML: %v\n%s", err, out)
+		}
+		se, ok := tok.(xml.StartElement)
+		if !ok {
+			continue
+		}
+		seen := map[xml.Name]bool{}
+		for _, a := range se.Attr {
+			if seen[a.Name] {
+				t.Errorf("duplicate attribute %v on <%s>", a.Name, se.Name.Local)
+			}
+			seen[a.Name] = true
+			if a.Name.Space == "urn:mpeg:cenc:2013" && a.Name.Local == "default_KID" {
+				sawKID = true
+			}
+			if a.Name.Space == "http://www.w3.org/2001/XMLSchema-instance" && a.Name.Local == "schemaLocation" {
+				sawSchema = true
+			}
+		}
+	}
+	if !sawKID || !sawSchema {
+		t.Errorf("prefixed attributes not resolved (KID=%v schemaLocation=%v)", sawKID, sawSchema)
+	}
+
+	// URL rewrites still applied.
+	wantBase := h.buildProxyURL("https://ext.example", "/proxy/stream", "https://cdn.example/dash/?a=1&b=2", opts)
+	var esc bytes.Buffer
+	_ = xml.EscapeText(&esc, []byte(wantBase))
+	if !strings.Contains(out, "<BaseURL>"+esc.String()+"</BaseURL>") {
+		t.Errorf("BaseURL not rewritten as expected:\n%s", out)
+	}
+	wantInit := dashBuildTemplateURL(h, "https://ext.example", "https://origin.example/stream/init-$RepresentationID$.m4s", opts)
+	esc.Reset()
+	_ = xml.EscapeText(&esc, []byte(wantInit))
+	if !strings.Contains(out, `initialization="`+esc.String()+`"`) {
+		t.Errorf("SegmentTemplate initialization not rewritten as expected:\n%s", out)
+	}
+	if !strings.Contains(out, "></SegmentTemplate>") {
+		t.Errorf("explicit end tag not preserved:\n%s", out)
+	}
+}
+
+func TestDashRewriteUnbalancedFallback(t *testing.T) {
+	h := dashNewTestHandler()
+	req := httptest.NewRequest("GET", "/proxy/mpd/manifest.m3u8?d=x", nil)
+	opts := &Options{Dest: "https://origin.example/master.mpd"}
+	in := []byte(`<MPD><Period></MPD>`)
+	if out := dashRewrite(h, req, opts, in); !bytes.Equal(out, in) {
+		t.Errorf("expected original bytes on unbalanced XML; got %q", out)
+	}
+}
