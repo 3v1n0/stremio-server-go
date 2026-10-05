@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -29,6 +30,12 @@ import (
 // janitor, not evicted on read, since a long-paused player may still come
 // back and re-request a segment.
 const relayTokenTTL = 2 * time.Hour
+
+// relayMaxTokens caps the number of live relay tokens. Playlist rewriting
+// registers one token per URI line, so an attacker-controlled upstream could
+// otherwise grow the map without bound within relayTokenTTL. When the cap is
+// hit, expired tokens are dropped first, then the oldest registrations.
+const relayMaxTokens = 16384
 
 // relayJanitorInterval is how often expired relay tokens are swept.
 const relayJanitorInterval = 5 * time.Minute
@@ -94,6 +101,8 @@ type mediaRelay struct {
 
 	mu     sync.Mutex
 	tokens map[string]relayEntry
+	byURL  map[string]string // upstream URL → token (dedupe)
+	order  []string          // tokens in registration order (eviction queue)
 }
 
 // globalRelay is the process-wide relay instance used by every ffmpeg/
@@ -109,13 +118,20 @@ var globalRelay = newMediaRelay(true)
 func newMediaRelay(blockPrivate bool) *mediaRelay {
 	return &mediaRelay{
 		tokens: make(map[string]relayEntry),
+		byURL:  make(map[string]string),
 		client: &http.Client{
-			Timeout: 30 * time.Second,
+			// No overall Timeout: http.Client.Timeout also bounds reading
+			// the response body, which would cut every media stream relayed
+			// through io.Copy after 30 s. Only the time to first response
+			// byte is bounded; the body lives as long as the caller (ffmpeg)
+			// keeps the request context open.
 			Transport: &http.Transport{
 				DialContext: (&net.Dialer{
 					Timeout: 10 * time.Second,
 					Control: netguard.DialControl(blockPrivate),
 				}).DialContext,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 30 * time.Second,
 			},
 			CheckRedirect: func(_ *http.Request, via []*http.Request) error {
 				if len(via) >= relayMaxRedirects {
@@ -161,11 +177,69 @@ func (r *mediaRelay) register(rawURL string) (string, error) {
 	if err := r.start(); err != nil {
 		return "", err
 	}
-	token := randomRelayToken()
+	now := time.Now()
+	exp := now.Add(relayTokenTTL)
 	r.mu.Lock()
-	r.tokens[token] = relayEntry{url: rawURL, expiresAt: time.Now().Add(relayTokenTTL)}
-	r.mu.Unlock()
+	defer r.mu.Unlock()
+	token, ok := r.byURL[rawURL]
+	if ok {
+		if e, live := r.tokens[token]; live && e.url == rawURL {
+			// Same upstream URL already has a token: reuse it (refreshing
+			// its expiry) so re-fetched playlists don't mint fresh tokens.
+			e.expiresAt = exp
+			r.tokens[token] = e
+			return fmt.Sprintf("http://127.0.0.1:%d/r/%s", r.port(), token), nil
+		}
+	}
+	r.evictLocked(now)
+	token = randomRelayToken()
+	r.tokens[token] = relayEntry{url: rawURL, expiresAt: exp}
+	r.byURL[rawURL] = token
+	r.order = append(r.order, token)
 	return fmt.Sprintf("http://127.0.0.1:%d/r/%s", r.port(), token), nil
+}
+
+// evictLocked makes room for one new token: if the map is at relayMaxTokens
+// it drops expired tokens, then the oldest registrations. r.mu must be held.
+func (r *mediaRelay) evictLocked(now time.Time) {
+	if len(r.tokens) < relayMaxTokens {
+		return
+	}
+	r.sweepLocked(now)
+	for len(r.tokens) >= relayMaxTokens && len(r.order) > 0 {
+		tok := r.order[0]
+		r.order = r.order[1:]
+		r.deleteTokenLocked(tok)
+	}
+}
+
+// sweepLocked drops expired tokens and compacts the eviction queue.
+// r.mu must be held.
+func (r *mediaRelay) sweepLocked(now time.Time) {
+	for k, v := range r.tokens {
+		if now.After(v.expiresAt) {
+			r.deleteTokenLocked(k)
+		}
+	}
+	live := make([]string, 0, len(r.tokens))
+	for _, tok := range r.order {
+		if _, ok := r.tokens[tok]; ok {
+			live = append(live, tok)
+		}
+	}
+	r.order = live
+}
+
+// deleteTokenLocked removes token from both indexes. r.mu must be held.
+func (r *mediaRelay) deleteTokenLocked(token string) {
+	e, ok := r.tokens[token]
+	if !ok {
+		return
+	}
+	delete(r.tokens, token)
+	if r.byURL[e.url] == token {
+		delete(r.byURL, e.url)
+	}
 }
 
 func randomRelayToken() string {
@@ -194,11 +268,7 @@ func (r *mediaRelay) janitor() {
 	for range ticker.C {
 		now := time.Now()
 		r.mu.Lock()
-		for k, v := range r.tokens {
-			if now.After(v.expiresAt) {
-				delete(r.tokens, k)
-			}
-		}
+		r.sweepLocked(now)
 		r.mu.Unlock()
 	}
 }
@@ -267,8 +337,31 @@ func (r *mediaRelay) proxy(w http.ResponseWriter, req *http.Request, upstream st
 	copyProxyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	if req.Method != http.MethodHead {
-		_, _ = io.Copy(w, resp.Body)
+		rd := &errTrackingReader{r: resp.Body}
+		_, _ = io.Copy(w, rd)
+		if rd.err != nil && !errors.Is(rd.err, io.EOF) {
+			// The upstream body broke mid-stream (reset, timeout, short
+			// read vs Content-Length). Abort the downstream connection so
+			// ffmpeg sees a failed transfer rather than a cleanly
+			// terminated (chunked) but truncated one.
+			panic(http.ErrAbortHandler)
+		}
 	}
+}
+
+// errTrackingReader records the first read error from the wrapped reader so
+// the caller can tell an upstream failure from a downstream write failure.
+type errTrackingReader struct {
+	r   io.Reader
+	err error
+}
+
+func (e *errTrackingReader) Read(p []byte) (int, error) {
+	n, err := e.r.Read(p)
+	if err != nil && e.err == nil {
+		e.err = err
+	}
+	return n, err
 }
 
 // relaySniffBytes bounds how much of a response body is inspected to detect

@@ -56,13 +56,20 @@ func newTestHLSManager(t *testing.T) *hlsManager {
 // public API — including the SSRF pre-flight — against a real local server.
 func stubOpenSubClientTransport(t *testing.T, ts *httptest.Server) string {
 	t.Helper()
-	orig := openSubClient.Transport
-	openSubClient.Transport = &http.Transport{
-		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, network, ts.Listener.Addr().String())
-		},
+	stub := func() *http.Transport {
+		return &http.Transport{
+			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, network, ts.Listener.Addr().String())
+			},
+		}
 	}
-	t.Cleanup(func() { openSubClient.Transport = orig })
+	orig, origSelf := openSubClient.Transport, openSubSelfClient.Transport
+	openSubClient.Transport = stub()
+	openSubSelfClient.Transport = stub()
+	t.Cleanup(func() {
+		openSubClient.Transport = orig
+		openSubSelfClient.Transport = origSelf
+	})
 	return "http://93.184.216.34"
 }
 
