@@ -235,6 +235,40 @@ func originAllowed(cfg types.Config, origin string) bool {
 	return false
 }
 
+// crossSiteBlocked reports whether r is a browser-originated cross-site request
+// that carries no Origin header and targets a side-effecting route. Browsers
+// omit Origin on cross-site <img>/<iframe>/link GETs, so originAllowed cannot
+// stop them; they do however always send Sec-Fetch-Site: cross-site. Requests
+// without Sec-Fetch-* (native shells, ffmpeg, curl) and same-origin/same-site/
+// none are unaffected, as is everything when cfg.AllowAllOrigins is set.
+// Media-playback routes (/{ih}/{idx}, /proxy, /hlsv2/..., /yt/{id}) are NOT
+// gated: <video src> and Safari's native HLS legitimately load them
+// cross-site without an Origin (including master.m3u8?mediaURL=).
+func crossSiteBlocked(cfg types.Config, r *http.Request) bool {
+	if cfg.AllowAllOrigins || r.Header.Get("Origin") != "" {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "cross-site") {
+		return false
+	}
+	return sideEffectingRoute(r)
+}
+
+// sideEffectingRoute reports whether the request path addresses a route that
+// mutates state or spawns processes/outbound calls on a plain GET.
+func sideEffectingRoute(r *http.Request) bool {
+	seg := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	first := seg[0]
+	if isInfoHash(first) {
+		return len(seg) >= 2 && (seg[1] == "create" || seg[1] == "remove")
+	}
+	switch first {
+	case "removeAll", "get-https", "casting":
+		return true
+	}
+	return false
+}
+
 // Shared, immutable streaming header values — pre-canonicalized keys to avoid
 // per-request key canonicalization (mirrors CORS pattern above).
 // textproto.CanonicalMIMEHeaderKey("transferMode.dlna.org")    = "Transfermode.dlna.org"
@@ -244,7 +278,18 @@ var (
 	streamCacheControl    = []string{"max-age=0, no-cache"}
 	streamTransferMode    = []string{"Streaming"}
 	streamContentFeatures = []string{"DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"}
+	streamNoSniff         = []string{"nosniff"}
+	streamCSPSandbox      = []string{"sandbox"}
 )
+
+// setActiveContentGuards stops upstream/torrent bytes served from this trusted
+// origin from executing as active content: nosniff pins the declared type, and
+// CSP sandbox gives any rendered document an opaque origin (its fetches carry
+// "Origin: null", which originAllowed rejects). Harmless for <video>/<audio>.
+func setActiveContentGuards(h http.Header) {
+	h["X-Content-Type-Options"] = streamNoSniff
+	h["Content-Security-Policy"] = streamCSPSandbox
+}
 
 // ServeHTTP enforces the Origin allowlist (SEC-1 / Contract 2), applies CORS,
 // handles preflight, and dispatches to the router. A disallowed Origin is
@@ -254,6 +299,10 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	origin := r.Header.Get("Origin")
 	if !originAllowed(s.cfg, origin) {
 		writeJSON(w, http.StatusForbidden, map[string]any{"error": "origin not allowed"})
+		return
+	}
+	if crossSiteBlocked(s.cfg, r) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "cross-site request not allowed"})
 		return
 	}
 	hdr := w.Header()
@@ -676,6 +725,7 @@ func (s *server) handleStream(w http.ResponseWriter, r *http.Request, ih, idxSeg
 	// Static DLNA/cache headers: direct canonical-key map assignment avoids
 	// per-request key canonicalization (mirrors the CORS pattern in ServeHTTP).
 	hdr := w.Header()
+	setActiveContentGuards(hdr)
 	hdr["Accept-Ranges"] = streamAcceptRanges
 	hdr["Content-Type"] = []string{mimeByName(f.Name)}
 	hdr["Cache-Control"] = streamCacheControl
@@ -1834,10 +1884,11 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request, seg []strin
 			w.Header().Set(k, v)
 		}
 	}
+	setActiveContentGuards(w.Header())
 	for _, h := range opts["r"] { // injected response headers; skip CORS headers the caller must not override
 		if i := strings.IndexByte(h, ':'); i > 0 {
 			k := http.CanonicalHeaderKey(strings.TrimSpace(h[:i]))
-			if strings.HasPrefix(k, "Access-Control-") {
+			if strings.HasPrefix(k, "Access-Control-") || k == "Content-Security-Policy" || k == "X-Content-Type-Options" {
 				continue
 			}
 			w.Header().Set(k, strings.TrimSpace(h[i+1:]))
