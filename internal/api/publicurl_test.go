@@ -35,10 +35,11 @@ func landingLocation(t *testing.T, cfg types.Config, target, peer string, header
 	return rec.Header().Get("Location")
 }
 
-// landingWant is the expected Location: the web UI with `streamingServer` set
-// to base.
+// landingWant is the expected Location: the web UI with both the shell's
+// `streamingServer` and stremio-web's `streamingServerUrl` set to base.
 func landingWant(webUI, base string) string {
-	return webUI + "?streamingServer=" + url.QueryEscape(base)
+	escaped := url.QueryEscape(base)
+	return webUI + "?streamingServer=" + escaped + "&streamingServerUrl=" + escaped
 }
 
 func TestLandingUsesPublicURL(t *testing.T) {

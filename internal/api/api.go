@@ -1329,10 +1329,14 @@ func (s *server) handleLanding(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid WEB_UI_LOCATION", http.StatusInternalServerError)
 		return
 	}
-	// Set the parameter on the parsed URL so an existing query string in
-	// WEB_UI_LOCATION is preserved and the query is encoded for us.
+	// Set the parameters on the parsed URL so an existing query string in
+	// WEB_UI_LOCATION is preserved and the query is encoded for us. The
+	// app.strem.io shell reads `streamingServer`; stremio-web reads
+	// `streamingServerUrl` (src/App/SearchParamsHandler.js), so set both and
+	// the redirect works whichever shell WEB_UI_LOCATION points at.
 	q := loc.Query()
 	q.Set("streamingServer", base)
+	q.Set("streamingServerUrl", base)
 	loc.RawQuery = q.Encode()
 	http.Redirect(w, r, loc.String(), http.StatusTemporaryRedirect)
 }
